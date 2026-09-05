@@ -22,12 +22,21 @@ extension Ghostty {
                     titleFallbackTimer?.invalidate()
                     titleFallbackTimer = nil
                 }
+                if title != oldValue, let controller = window?.windowController as? TerminalController {
+                    TabOrganization.shared.capturedStateDidChange(controller)
+                }
             }
         }
 
         // The current pwd of the surface as defined by the pty. This can be
         // changed with escape codes.
-        @Published var pwd: String?
+        @Published var pwd: String? {
+            didSet {
+                if pwd != oldValue, let controller = window?.windowController as? TerminalController {
+                    TabOrganization.shared.capturedStateDidChange(controller)
+                }
+            }
+        }
 
         // The cell size of this surface. This is set by the core when the
         // surface is first created and any time the cell size changes (i.e.
@@ -399,6 +408,9 @@ extension Ghostty {
                 return
             }
             self.surfaceModel = Ghostty.Surface(cSurface: surface)
+            #if DEBUG
+            NativeRestorationProbe.shared?.surfaceCreated(self)
+            #endif
 
             // Setup our tracking area so we get mouse moved events
             updateTrackingAreas()
@@ -442,6 +454,9 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             guard self.focused != focused else { return }
             self.focused = focused
+            if let controller = window?.windowController as? TerminalController {
+                TabOrganization.shared.capturedStateDidChange(controller)
+            }
 
             // If we lost our focus then remove the mouse event suppression so
             // our mouse release event leaving the surface can properly be
@@ -1784,6 +1799,9 @@ extension Ghostty {
             let isUserSetTitle = try container.decodeIfPresent(Bool.self, forKey: .isUserSetTitle) ?? false
 
             self.init(app, baseConfig: config, uuid: uuid)
+            #if DEBUG
+            NativeRestorationProbe.shared?.surfaceDecoded(self, savedPWD: config.workingDirectory)
+            #endif
 
             // Restore the saved title after initialization
             if let title = savedTitle {

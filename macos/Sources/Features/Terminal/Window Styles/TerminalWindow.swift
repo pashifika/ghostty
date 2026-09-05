@@ -65,6 +65,7 @@ class TerminalWindow: NSWindow {
             guard tabColor != oldValue else { return }
             tabColorIndicator.rootView = TabColorIndicatorView(tabColor: tabColor)
             invalidateRestorableState()
+            if let terminalController { TabOrganization.shared.capturedStateDidChange(terminalController) }
         }
     }
 
@@ -238,7 +239,9 @@ class TerminalWindow: NSWindow {
     }
 
     override func mergeAllWindows(_ sender: Any?) {
+        TabOrganization.shared.willMergeWindows(into: self)
         super.mergeAllWindows(sender)
+        TabOrganization.shared.didMergeWindows()
 
         // It takes an event loop cycle to merge all the windows so we set a
         // short timer to relabel the tabs (issue #1902)
@@ -398,6 +401,9 @@ class TerminalWindow: NSWindow {
             /// Check ``titlebarFont`` down below
             /// to see why we need to check `hasMoreThanOneTabs` here
             titlebarTextField?.usesSingleLineMode = !hasMoreThanOneTabs
+            if title != oldValue, let terminalController {
+                TabOrganization.shared.capturedStateDidChange(terminalController)
+            }
         }
     }
 
@@ -704,36 +710,80 @@ extension TerminalWindow {
 
     private static let tabColorPaletteIdentifier = NSUserInterfaceItemIdentifier("com.mitchellh.ghostty.tabColorPalette")
 
+    /// Builds a menu for an owned tab view without borrowing AppKit's native menu.
+    func makeTabContextMenu(for targetWindow: TerminalWindow) -> NSMenu? {
+        guard let targetController = targetWindow.terminalController else { return nil }
+
+        let menu = NSMenu(title: "Terminal Tab")
+        let closeItem = NSMenuItem(
+            title: "Close",
+            action: #selector(TerminalController.closeTab(_:)),
+            keyEquivalent: ""
+        )
+        closeItem.target = targetController
+        menu.addItem(closeItem)
+        menu.addItem(CloseOtherTabsMenuItem(controller: targetController))
+        menu.addItem(.separator())
+
+        let moveItem = NSMenuItem(
+            title: "Move Tab to New Window",
+            action: #selector(NSWindow.moveTabToNewWindow(_:)),
+            keyEquivalent: ""
+        )
+        moveItem.target = targetWindow
+        menu.addItem(moveItem)
+
+        let overviewItem = NSMenuItem(
+            title: "Show All Tabs",
+            action: #selector(NSWindow.toggleTabOverview(_:)),
+            keyEquivalent: ""
+        )
+        overviewItem.target = targetWindow
+        menu.addItem(overviewItem)
+
+        appendGhosttyTabContextMenuItems(to: menu, target: targetController)
+        return menu
+    }
+
     func configureTabContextMenuIfNeeded(_ menu: NSMenu) {
         guard isTabContextMenu(menu) else { return }
 
         // Get the target from an existing menu item. The native tab context menu items
         // target the specific window/controller that was right-clicked, not the focused one.
         // We need to use that same target so validation and action use the correct tab.
-        let targetController = menu.items
-            .first { $0.action == NSSelectorFromString("performClose:") }
-            .flatMap { $0.target as? NSWindow }
-            .flatMap { $0.windowController as? TerminalController }
+        guard let targetController = menu.items
+            .first(where: { $0.action == #selector(NSWindow.performClose(_:)) })
+            .flatMap({ $0.target as? NSWindow })
+            .flatMap({ $0.windowController as? TerminalController }) else { return }
+
+        appendGhosttyTabContextMenuItems(to: menu, target: targetController)
+    }
+
+    private func appendGhosttyTabContextMenuItems(to menu: NSMenu, target: TerminalController) {
+        menu.removeItems(withIdentifiers: [Self.closeTabsOnRightMenuItemIdentifier])
 
         // Close tabs to the right
         let item = NSMenuItem(title: "Close Tabs to the Right", action: #selector(TerminalController.closeTabsOnTheRight(_:)), keyEquivalent: "")
         item.identifier = Self.closeTabsOnRightMenuItemIdentifier
-        item.target = targetController
+        item.target = target
         item.setImageIfDesired(systemSymbolName: "xmark")
-        if menu.insertItem(item, after: NSSelectorFromString("performCloseOtherTabs:")) == nil,
+        if menu.insertItem(item, after: #selector(TerminalController.closeOtherTabs(_:))) == nil,
+           menu.insertItem(item, after: NSSelectorFromString("performCloseOtherTabs:")) == nil,
            menu.insertItem(item, after: NSSelectorFromString("performClose:")) == nil {
             menu.addItem(item)
         }
 
         // Other close items should have the xmark to match Safari on macOS 26
         for menuItem in menu.items {
-            if menuItem.action == NSSelectorFromString("performClose:") ||
+            if menuItem.action == #selector(TerminalController.closeTab(_:)) ||
+                menuItem.action == #selector(TerminalController.closeOtherTabs(_:)) ||
+                menuItem.action == #selector(NSWindow.performClose(_:)) ||
                 menuItem.action == NSSelectorFromString("performCloseOtherTabs:") {
                 menuItem.setImageIfDesired(systemSymbolName: "xmark")
             }
         }
 
-        appendTabModifierSection(to: menu, target: targetController)
+        appendTabModifierSection(to: menu, target: target)
     }
 
     private func isTabContextMenu(_ menu: NSMenu) -> Bool {
@@ -751,7 +801,7 @@ extension TerminalWindow {
         return requiredSelectors.isSubset(of: selectorNames)
     }
 
-    private func appendTabModifierSection(to menu: NSMenu, target: TerminalController?) {
+    private func appendTabModifierSection(to menu: NSMenu, target: TerminalController) {
         menu.removeItems(withIdentifiers: [
             Self.tabColorSeparatorIdentifier,
             Self.changeTitleMenuItemIdentifier,
@@ -766,18 +816,43 @@ extension TerminalWindow {
         let changeTitleItem = NSMenuItem(title: "Rename Tab...", action: #selector(TerminalWindow.renameTabFromContextMenu(_:)), keyEquivalent: "")
         changeTitleItem.identifier = Self.changeTitleMenuItemIdentifier
         changeTitleItem.target = self
-        changeTitleItem.representedObject = target?.window
+        changeTitleItem.representedObject = target.window
         changeTitleItem.setImageIfDesired(systemSymbolName: "pencil.line")
         menu.addItem(changeTitleItem)
 
         let paletteItem = NSMenuItem()
         paletteItem.identifier = Self.tabColorPaletteIdentifier
         paletteItem.view = makeTabColorPaletteView(
-            selectedColor: (target?.window as? TerminalWindow)?.tabColor ?? .none
+            selectedColor: (target.window as? TerminalWindow)?.tabColor ?? .none
         ) { [weak target] color in
             (target?.window as? TerminalWindow)?.tabColor = color
         }
         menu.addItem(paletteItem)
+    }
+
+    /// The controller action is shared; this item adds the missing single-tab validation.
+    private final class CloseOtherTabsMenuItem: NSMenuItem, NSMenuItemValidation {
+        // Keep the explicit action target alive while the contextual menu is tracking.
+        private let controller: TerminalController
+
+        init(controller: TerminalController) {
+            self.controller = controller
+            super.init(title: "Close Other Tabs", action: #selector(CloseOtherTabsMenuItem.closeOtherTabs(_:)), keyEquivalent: "")
+            target = self
+        }
+
+        required init(coder: NSCoder) {
+            fatalError("init(coder:) is not supported")
+        }
+
+        @objc private func closeOtherTabs(_ sender: NSMenuItem) {
+            controller.closeOtherTabs(sender)
+        }
+
+        func validateMenuItem(_ item: NSMenuItem) -> Bool {
+            guard (controller.window?.tabGroup?.windows.count ?? 0) > 1 else { return false }
+            return controller.validateMenuItem(item)
+        }
     }
 }
 

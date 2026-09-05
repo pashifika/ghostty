@@ -57,6 +57,16 @@ struct ConfigTests {
         #expect(config.macosWindowShadow == true)
     }
 
+    @Test func macosTabCloseButtonDefaultsToTrue() throws {
+        let config = try TemporaryConfig("")
+        #expect(config.macosTabCloseButton == true)
+    }
+
+    @Test func macosTabCloseButtonSetToFalse() throws {
+        let config = try TemporaryConfig("macos-tab-close-button = false")
+        #expect(config.macosTabCloseButton == false)
+    }
+
     @Test func maximizeDefaultsToFalse() throws {
         let config = try TemporaryConfig("")
         #expect(config.maximize == false)
@@ -101,6 +111,7 @@ struct ConfigTests {
         ("transparent", Ghostty.Config.MacOSTitlebarStyle.transparent),
         ("tabs", Ghostty.Config.MacOSTitlebarStyle.tabs),
         ("hidden", Ghostty.Config.MacOSTitlebarStyle.hidden),
+        ("groups", Ghostty.Config.MacOSTitlebarStyle.groups),
     ])
     func macosTitlebarStyleValues(raw: String, expected: Ghostty.Config.MacOSTitlebarStyle) throws {
         let config = try TemporaryConfig("macos-titlebar-style = \(raw)")

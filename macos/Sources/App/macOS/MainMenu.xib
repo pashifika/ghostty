@@ -401,6 +401,12 @@
                                     <action selector="toggleVisibility:" target="bbz-4X-AYv" id="2vT-tL-3tQ"/>
                                 </connections>
                             </menuItem>
+                            <menuItem title="Focus Tab Groups" id="GtF-oc-us1">
+                                <modifierMask key="keyEquivalentModifierMask"/>
+                                <connections>
+                                    <action selector="focusTabGroups:" target="-1" id="GtF-ac-tn1"/>
+                                </connections>
+                            </menuItem>
                             <menuItem isSeparatorItem="YES" id="rlu-tP-x0P"/>
                             <menuItem title="Zoom Split" id="oPd-mn-IEH">
                                 <modifierMask key="keyEquivalentModifierMask"/>

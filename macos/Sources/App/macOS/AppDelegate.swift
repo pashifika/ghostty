@@ -176,6 +176,9 @@ class AppDelegate: NSObject,
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         #if DEBUG
+        NativeRestorationProbe.shared?.start()
+        #endif
+        #if DEBUG
         if
             let suite = UserDefaults.ghosttySuite,
             let clear = ProcessInfo.processInfo.environment["GHOSTTY_CLEAR_USER_DEFAULTS"],
@@ -183,6 +186,7 @@ class AppDelegate: NSObject,
             UserDefaults.ghostty.removePersistentDomain(forName: suite)
         }
         #endif
+        TabOrganization.shared.start(config: ghostty.config)
         UserDefaults.ghostty.register(defaults: [
             // Disable the automatic full screen menu item because we handle
             // it manually.
@@ -201,6 +205,10 @@ class AppDelegate: NSObject,
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        TabOrganization.shared.applicationDidFinishLaunching()
+        #if DEBUG
+        NativeRestorationProbe.shared?.lifecycle("didFinishLaunching")
+        #endif
         // System settings overrides
         UserDefaults.ghostty.register(defaults: [
             // Disable this so that repeated key events make it through to our terminal views.
@@ -351,6 +359,10 @@ class AppDelegate: NSObject,
         // First launch stuff
         if !applicationHasBecomeActive {
             applicationHasBecomeActive = true
+            TabOrganization.shared.applicationDidBecomeActive()
+            #if DEBUG
+            NativeRestorationProbe.shared?.lifecycle("firstActivation")
+            #endif
 
             // Let's launch our first window. We only do this if we have no other windows. It
             // is possible to have other windows in a few scenarios:
@@ -358,7 +370,12 @@ class AppDelegate: NSObject,
             //   - if we're restoring from persisted state
             if TerminalController.all.isEmpty && derivedConfig.initialWindow {
                 undoManager.disableUndoRegistration()
-                _ = TerminalController.newWindow(ghostty)
+                let controller = TerminalController.newWindow(ghostty)
+                #if DEBUG
+                NativeRestorationProbe.shared?.fallbackWindowCreated(controller)
+                #else
+                _ = controller
+                #endif
                 undoManager.enableUndoRegistration()
             }
         }
@@ -642,6 +659,7 @@ class AppDelegate: NSObject,
         self.menuQuickTerminal?.state = if quickController.visible { .on } else { .off }
     }
 
+    @MainActor
     @objc private func ghosttyConfigDidChange(_ notification: Notification) {
         // We only care if the configuration is a global configuration, not a surface one.
         guard notification.object == nil else { return }
@@ -747,6 +765,7 @@ class AppDelegate: NSObject,
         NSApp.dockTile.display()
     }
 
+    @MainActor
     private func ghosttyConfigDidChange(config: Ghostty.Config) {
         // Update the config we need to store
         self.derivedConfig = DerivedConfig(config)
@@ -760,6 +779,7 @@ class AppDelegate: NSObject,
         case "default": fallthrough
         default: UserDefaults.ghostty.removeObject(forKey: "NSQuitAlwaysKeepsWindows")
         }
+        TabOrganization.shared.configurationDidChange(config)
 
         // Sync our auto-update settings. If SUEnableAutomaticChecks (in our Info.plist) is
         // explicitly false (NO), auto-updates are disabled. Otherwise, we use the behavior
@@ -862,6 +882,7 @@ class AppDelegate: NSObject,
         Self.logger.debug("application will save window state")
 
         guard ghostty.config.windowSaveState != "never" else { return }
+        TabOrganization.shared.flush()
 
         // Encode our quick terminal state if we have it.
         switch quickTerminalControllerState {
@@ -878,6 +899,9 @@ class AppDelegate: NSObject,
     }
 
     func application(_ app: NSApplication, didDecodeRestorableState coder: NSCoder) {
+        #if DEBUG
+        NativeRestorationProbe.shared?.lifecycle("didDecodeRestorableState")
+        #endif
         Self.logger.debug("application will restore window state")
 
         // Decode our quick terminal state.

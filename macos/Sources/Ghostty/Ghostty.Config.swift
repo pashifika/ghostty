@@ -394,6 +394,16 @@ extension Ghostty {
             return v
         }
 
+        /// Whether tabs in the grouped titlebar strip show their close button. Presentation
+        /// only; it never affects native tab bars or window controls.
+        var macosTabCloseButton: Bool {
+            guard let config = self.config else { return true }
+            var v = true
+            let key = "macos-tab-close-button"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         var macosIcon: MacOSIcon {
             let defaultValue = MacOSIcon.official
             guard let config = self.config else { return defaultValue }
@@ -917,6 +927,6 @@ extension Ghostty.Config {
 
     enum MacOSTitlebarStyle: String {
         static let `default` = MacOSTitlebarStyle.transparent
-        case native, transparent, tabs, hidden
+        case native, transparent, tabs, hidden, groups
     }
 }
