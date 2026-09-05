@@ -269,12 +269,13 @@ final class GroupedTitlebarAcceptanceTests: GhosttyCustomConfigCase {
         let name = "A deliberately long project name retained beyond the visible titlebar label"
         try createGroup(name, from: "Terminal 1", in: app)
         for index in 2...8 {
-            app.typeKey("t", modifierFlags: .command)
+            app.toolbars.buttons["New Tab"].firstMatch.click()
             try nameTab("Terminal \(index)", in: app)
         }
         let window = app.windows.firstMatch
         let origin = window.frame.origin
-        let titlebarGrip = window.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.03))
+        let titlebarGrip = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0))
+            .withOffset(CGVector(dx: -6, dy: 20))
         titlebarGrip.press(forDuration: 0.1, thenDragTo: titlebarGrip.withOffset(CGVector(dx: -80, dy: 60)))
         XCTAssertGreaterThan(abs(window.frame.origin.x - origin.x), 40)
         XCTAssertGreaterThan(abs(window.frame.origin.y - origin.y), 30)
@@ -282,6 +283,10 @@ final class GroupedTitlebarAcceptanceTests: GhosttyCustomConfigCase {
         let resizeGrip = window.coordinate(withNormalizedOffset: CGVector(dx: 0.998, dy: 0.8))
         resizeGrip.press(forDuration: 0.1, thenDragTo: resizeGrip.withOffset(CGVector(dx: -120, dy: 0)))
         XCTAssertLessThan(window.frame.width, width - 60)
+        let newTab = app.toolbars.buttons["New Tab"].firstMatch
+        XCTAssertTrue(newTab.isHittable)
+        XCTAssertLessThan(window.frame.maxX - newTab.frame.maxX, 30)
+        XCTAssertEqual(app.toolbars.scrollBars.count, 0)
         XCTAssertTrue(app.toolbars.buttons["Scroll tabs left"].firstMatch.exists)
         XCTAssertTrue(tab("Terminal 8", in: app).isHittable)
         app.typeKey("1", modifierFlags: .command)

@@ -203,14 +203,11 @@ final class GroupedTitlebarTerminalWindow: TransparentTitlebarTerminalWindow, NS
         strip.showsCloseButtons = config.macosTabCloseButton
     }
 
-    /// Toolbar items are not stretched by AppKit, so the strip gets the row width minus the space
-    /// the window-control inset, the trailing titlebar accessories and the toolbar margins occupy.
-    /// Native fullscreen hides the window controls and their inset; hidden window buttons keep
-    /// the toolbar's leading inset, so only fullscreen reclaims it. Over-estimating would push the
-    /// item into the toolbar overflow menu, so the reserve stays on the generous side.
+    /// Fill the toolbar after its native window-control inset and outer margins.
+    /// The strip's fixed new-tab button defines the trailing viewport boundary.
     private func preferredStripWidth() -> CGFloat {
         let leading: CGFloat = styleMask.contains(.fullScreen) ? 16 : 88
-        let trailing: CGFloat = 56
+        let trailing: CGFloat = 16
         return max(160, frame.width - leading - trailing)
     }
 
@@ -224,7 +221,7 @@ final class GroupedTitlebarTerminalWindow: TransparentTitlebarTerminalWindow, NS
     // MARK: NSToolbarDelegate
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [Self.stripItemIdentifier, .flexibleSpace]
+        [Self.stripItemIdentifier]
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -290,10 +287,9 @@ protocol GroupedTabStripDelegate: AnyObject {
 
 // MARK: - Strip
 
-/// One horizontal row: a horizontally scrolling canvas of group headers and tabs, overflow scroll
-/// affordances, and a trailing pad that always drags the window. The strip renders a facade
-/// presentation, performs within-window drag and drop, and carries the keyboard/accessibility
-/// surface of the row. It never touches native windows or surfaces.
+/// One horizontal row: a scrolling canvas of group headers and tabs, overflow controls,
+/// and a fixed trailing new-tab button. Empty canvas space remains available for window dragging.
+/// The strip renders facade state and never owns terminal lifecycle.
 final class GroupedTabStrip: NSView {
     static let rowHeight: CGFloat = 28
 
@@ -314,7 +310,7 @@ final class GroupedTabStrip: NSView {
         static let tabSpacing: CGFloat = 4
         static let sectionGap: CGFloat = 10
         static let separatorWidth: CGFloat = 1
-        static let dragPadWidth: CGFloat = 40
+        static let newTabButtonWidth: CGFloat = 28
         static let scrollButtonWidth: CGFloat = 18
         static let dragThreshold: CGFloat = 4
         static let detachDistance: CGFloat = 28
@@ -345,7 +341,10 @@ final class GroupedTabStrip: NSView {
 
     private let scrollView = NSScrollView()
     private let canvas = GroupedTabStripCanvas()
-    private let dragPad = GroupedStripDragPad()
+    private let newTabButton = NSButton(
+        image: NSImage(systemSymbolName: "plus", accessibilityDescription: "New Tab")!,
+        target: nil,
+        action: #selector(TerminalController.newTab(_:)))
     private let leftButton = GroupedStripScrollButton(direction: .left)
     private let rightButton = GroupedStripScrollButton(direction: .right)
 
@@ -385,10 +384,8 @@ final class GroupedTabStrip: NSView {
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
 
-        scrollView.hasHorizontalScroller = true
+        scrollView.hasHorizontalScroller = false
         scrollView.hasVerticalScroller = false
-        scrollView.autohidesScrollers = true
-        scrollView.scrollerStyle = .overlay
         scrollView.horizontalScrollElasticity = .none
         scrollView.verticalScrollElasticity = .none
         scrollView.drawsBackground = false
@@ -408,9 +405,12 @@ final class GroupedTabStrip: NSView {
         rightButton.onPress = { [weak self] in self?.scrollByPage(direction: 1) }
         leftButton.isHidden = true
         rightButton.isHidden = true
+        newTabButton.isBordered = false
+        newTabButton.toolTip = "New Tab"
+        newTabButton.setAccessibilityLabel("New Tab")
 
         addSubview(scrollView)
-        addSubview(dragPad)
+        addSubview(newTabButton)
         addSubview(leftButton)
         addSubview(rightButton)
 
@@ -533,9 +533,9 @@ final class GroupedTabStrip: NSView {
     override func layout() {
         super.layout()
         let bounds = self.bounds
-        dragPad.frame = NSRect(x: bounds.maxX - Metrics.dragPadWidth, y: 0,
-                               width: Metrics.dragPadWidth, height: bounds.height)
-        scrollView.frame = NSRect(x: 0, y: 0, width: max(0, dragPad.frame.minX - 4), height: bounds.height)
+        newTabButton.frame = NSRect(x: max(0, bounds.maxX - Metrics.newTabButtonWidth), y: 0,
+                                    width: Metrics.newTabButtonWidth, height: bounds.height)
+        scrollView.frame = NSRect(x: 0, y: 0, width: newTabButton.frame.minX, height: bounds.height)
         leftButton.frame = NSRect(x: scrollView.frame.minX, y: 0,
                                   width: Metrics.scrollButtonWidth, height: bounds.height)
         rightButton.frame = NSRect(x: max(scrollView.frame.minX, scrollView.frame.maxX - Metrics.scrollButtonWidth), y: 0,
@@ -1705,36 +1705,6 @@ private final class GroupedGroupHeaderItem: GroupedStripItem {
 }
 
 // MARK: - Chrome
-
-/// A guaranteed window-drag region at the trailing edge of the row, outside the scrolling area.
-private final class GroupedStripDragPad: NSView {
-    override var mouseDownCanMoveWindow: Bool { true }
-    override var acceptsFirstResponder: Bool { false }
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        setAccessibilityElement(false)
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
-
-    override func mouseDown(with event: NSEvent) {
-        window?.performDrag(with: event)
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        // A faint grip marks the region without competing with the tabs.
-        NSColor.tertiaryLabelColor.withAlphaComponent(0.5).setFill()
-        let dot: CGFloat = 2
-        let columns: [CGFloat] = [bounds.midX - 3, bounds.midX + 1]
-        let rows: [CGFloat] = [bounds.midY - 5, bounds.midY - 1, bounds.midY + 3]
-        for x in columns {
-            for y in rows {
-                NSBezierPath(ovalIn: NSRect(x: x, y: y, width: dot, height: dot)).fill()
-            }
-        }
-    }
-}
 
 /// Overflow affordance shown at a clipped edge of the scrolling row; presses scroll a page.
 private final class GroupedStripScrollButton: NSView {
