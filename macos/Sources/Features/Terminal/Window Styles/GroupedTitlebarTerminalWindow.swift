@@ -58,7 +58,6 @@ final class GroupedTitlebarTerminalWindow: TransparentTitlebarTerminalWindow, NS
         toolbar.autosavesConfiguration = false
         self.toolbar = toolbar
         toolbarStyle = .unifiedCompact
-        // A system separator would cut across the selected tab's open lower edge.
         titlebarSeparatorStyle = .none
 
         strip.delegate = self
@@ -129,9 +128,12 @@ final class GroupedTitlebarTerminalWindow: TransparentTitlebarTerminalWindow, NS
         return super.performKeyEquivalent(with: event)
     }
 
-    /// Toolbar event routing does not deliver context clicks to a custom item view. Only clicks
-    /// on our own items are redirected; every other event keeps its native routing.
+    /// Toolbar routing skips context clicks and wheel events in custom views.
+    /// Redirect only events targeting our items or scrolling viewport.
     override func sendEvent(_ event: NSEvent) {
+        if event.type == .scrollWheel, event.window === self, strip.handleScrollWheel(event) {
+            return
+        }
         if Self.isContextClick(event), event.window === self, let item = strip.item(at: event) {
             strip.showContextMenu(for: item, with: event)
             return
@@ -153,13 +155,9 @@ final class GroupedTitlebarTerminalWindow: TransparentTitlebarTerminalWindow, NS
         scheduleRefresh()
     }
 
-    override func syncAppearance(_ surfaceConfig: Ghostty.SurfaceView.DerivedConfig) {
-        super.syncAppearance(surfaceConfig)
-        // Transparent/glass windows already paint the terminal background behind the toolbar.
-        // Leave that backing visible rather than applying the configured opacity a second time.
-        strip.selectionBackgroundColor = isOpaque
-            ? (preferredBackgroundColor ?? backgroundColor).withAlphaComponent(1)
-            : nil
+    override func resignMain() {
+        super.resignMain()
+        scheduleRefresh()
     }
 
     // MARK: Native Tab Bar Suppression
@@ -307,9 +305,8 @@ final class GroupedTabStrip: NSView {
 
     enum Metrics {
         static let itemHeight: CGFloat = 24
-        static let cornerRadius: CGFloat = 6
-        static let shoulderRadius: CGFloat = 4
-        static let canvasInset: CGFloat = 4
+        static let cornerRadius: CGFloat = 12
+        static let canvasInset: CGFloat = 2
         static let horizontalPadding: CGFloat = 8
         static let iconSpacing: CGFloat = 5
         static let colorDotSize: CGFloat = 7
@@ -324,7 +321,8 @@ final class GroupedTabStrip: NSView {
         static let sectionGap: CGFloat = 10
         static let separatorWidth: CGFloat = 1
         static let newTabButtonWidth: CGFloat = 28
-        static let scrollButtonWidth: CGFloat = 18
+        static let newTabButtonGap: CGFloat = 4
+        static let scrollButtonWidth: CGFloat = 22
         static let dragThreshold: CGFloat = 4
         static let detachDistance: CGFloat = 28
         static let autoScrollMargin: CGFloat = 24
@@ -333,9 +331,8 @@ final class GroupedTabStrip: NSView {
     }
 
     weak var delegate: GroupedTabStripDelegate?
-    fileprivate weak var terminalWindow: TerminalWindow?
-    fileprivate var selectionBackgroundColor: NSColor? {
-        didSet { canvas.selectionBackgroundColor = selectionBackgroundColor }
+    fileprivate weak var terminalWindow: TerminalWindow? {
+        didSet { canvas.terminalWindow = terminalWindow }
     }
 
     /// `macos-tab-close-button`. Presentation only; reloading it relays out the existing items.
@@ -375,7 +372,6 @@ final class GroupedTabStrip: NSView {
     private var lastViewportWidth: CGFloat = 0
     private var press: Press?
     private var boundsObserver: NSObjectProtocol?
-    private var toolbarBottomInset: CGFloat = 0
 
     fileprivate enum Entry {
         case group(GroupedGroupHeaderItem)
@@ -394,6 +390,9 @@ final class GroupedTabStrip: NSView {
     fileprivate struct GroupBlock {
         let id: UUID
         let rect: NSRect
+        let color: TerminalTabColor
+        let collapsed: Bool
+        let gaps: NSBezierPath?
     }
 
     override init(frame: NSRect) {
@@ -422,7 +421,9 @@ final class GroupedTabStrip: NSView {
         rightButton.onPress = { [weak self] in self?.scrollByPage(direction: 1) }
         leftButton.isHidden = true
         rightButton.isHidden = true
-        newTabButton.isBordered = false
+        newTabButton.isBordered = true
+        newTabButton.bezelStyle = .circular
+        newTabButton.controlSize = .small
         newTabButton.toolTip = "New Tab"
         newTabButton.setAccessibilityLabel("New Tab")
 
@@ -537,32 +538,17 @@ final class GroupedTabStrip: NSView {
 
     // MARK: Layout
 
-    /// Keep the toolbar's 28-point alignment row, but include its lower margin in our owned
-    /// drawing surface. Unlike drawing outside a view, this also extends the scroll clip.
-    override var alignmentRectInsets: NSEdgeInsets {
-        NSEdgeInsets(top: 0, left: 0, bottom: toolbarBottomInset, right: 0)
+    private var rowBounds: NSRect { bounds }
+
+    private var stripBounds: NSRect {
+        NSRect(x: bounds.minX, y: bounds.minY,
+               width: max(0, bounds.width - Metrics.newTabButtonWidth - Metrics.newTabButtonGap),
+               height: bounds.height)
     }
 
-    private var rowBounds: NSRect {
-        NSRect(x: bounds.minX, y: bounds.maxY - Self.rowHeight, width: bounds.width, height: Self.rowHeight)
-    }
-
-    private func updateToolbarInset() {
-        guard let window, let terminalWindow, superview != nil, bounds.height >= Self.rowHeight else { return }
-        // Native fullscreen rehosts the toolbar in a separate window. Its lower edge is the
-        // content-facing edge; the terminal's contentLayoutRect belongs to a different window.
-        let contentTop = window === terminalWindow ? window.contentLayoutRect.maxY : 0
-        let rowBottom = convert(NSPoint(x: rowBounds.minX, y: rowBounds.minY), to: nil).y
-        let scale = window.backingScaleFactor
-        let inset = max(0, ceil((rowBottom - contentTop) * scale) / scale)
-        guard inset != toolbarBottomInset else { return }
-
-        let alignmentFrame = alignmentRect(forFrame: frame)
-        toolbarBottomInset = inset
-        // Preserve the alignment rectangle (and therefore every control's screen position).
-        // AppKit uses the same public transform when it next lays out the toolbar item.
-        frame = frame(forAlignmentRect: alignmentFrame)
-        needsUpdateConstraints = true
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.labelColor.withAlphaComponent(0.05).setFill()
+        NSBezierPath(roundedRect: stripBounds, xRadius: Self.rowHeight / 2, yRadius: Self.rowHeight / 2).fill()
     }
 
     override func setFrameOrigin(_ newOrigin: NSPoint) {
@@ -582,13 +568,13 @@ final class GroupedTabStrip: NSView {
 
     override func layout() {
         super.layout()
-        updateToolbarInset()
+        needsDisplay = true
         let bounds = self.bounds
         let row = rowBounds
         let scrollOrigin = scrollView.contentView.bounds.minX
         newTabButton.frame = NSRect(x: max(0, bounds.maxX - Metrics.newTabButtonWidth), y: row.minY,
                                     width: Metrics.newTabButtonWidth, height: row.height)
-        scrollView.frame = NSRect(x: 0, y: 0, width: newTabButton.frame.minX, height: bounds.height)
+        scrollView.frame = stripBounds
         leftButton.frame = NSRect(x: scrollView.frame.minX, y: row.minY,
                                   width: Metrics.scrollButtonWidth, height: row.height)
         rightButton.frame = NSRect(x: max(scrollView.frame.minX, scrollView.frame.maxX - Metrics.scrollButtonWidth), y: row.minY,
@@ -643,7 +629,7 @@ final class GroupedTabStrip: NSView {
         let naturalTotal = naturals.reduce(0, +) + fixed
         let minimumTotal = minimums.reduce(0, +) + fixed
         if minimumTotal > viewport + 0.5 {
-            // Borderless arrows live beside the viewport, never over a clipped tab label.
+            // Reserve both edge slots while overflowing, independent of arrow visibility.
             scrollView.frame = scrollView.frame.insetBy(dx: Metrics.scrollButtonWidth, dy: 0)
             viewport = scrollView.contentSize.width
         }
@@ -710,11 +696,15 @@ final class GroupedTabStrip: NSView {
         var blocks: [GroupBlock] = []
         var currentHeader: GroupedGroupHeaderItem?
         var currentRect = NSRect.zero
+        var previousFrame = NSRect.zero
+        var gaps: NSBezierPath?
         func flush() {
             if let header = currentHeader {
-                blocks.append(GroupBlock(id: header.groupID, rect: currentRect))
+                blocks.append(GroupBlock(id: header.groupID, rect: currentRect, color: header.color,
+                                         collapsed: !header.isActive, gaps: gaps))
             }
             currentHeader = nil
+            gaps = nil
         }
         for (entry, frame) in zip(entries, entryFrames) {
             switch entry {
@@ -722,8 +712,14 @@ final class GroupedTabStrip: NSView {
                 flush()
                 currentHeader = header
                 currentRect = frame
+                previousFrame = frame
+                if header.color != .none && header.isActive { gaps = NSBezierPath() }
             case .tab(_, let groupID):
                 if let header = currentHeader, header.groupID == groupID {
+                    if let gaps {
+                        gaps.append(Self.gapOutline(between: previousFrame, and: frame))
+                    }
+                    previousFrame = frame
                     currentRect = currentRect.union(frame)
                 } else {
                     flush()
@@ -736,7 +732,41 @@ final class GroupedTabStrip: NSView {
         return blocks
     }
 
+    /// The internal gap follows both item faces without painting underneath either one.
+    private static func gapOutline(between left: NSRect, and right: NSRect) -> NSBezierPath {
+        let radius = Metrics.cornerRadius
+        let arc: CGFloat = 0.5522847498
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: left.maxX - radius, y: left.maxY))
+        path.line(to: NSPoint(x: right.minX + radius, y: right.maxY))
+        path.curve(to: NSPoint(x: right.minX, y: right.maxY - radius),
+                   controlPoint1: NSPoint(x: right.minX + radius * (1 - arc), y: right.maxY),
+                   controlPoint2: NSPoint(x: right.minX, y: right.maxY - radius * (1 - arc)))
+        path.line(to: NSPoint(x: right.minX, y: right.minY + radius))
+        path.curve(to: NSPoint(x: right.minX + radius, y: right.minY),
+                   controlPoint1: NSPoint(x: right.minX, y: right.minY + radius * (1 - arc)),
+                   controlPoint2: NSPoint(x: right.minX + radius * (1 - arc), y: right.minY))
+        path.line(to: NSPoint(x: left.maxX - radius, y: left.minY))
+        path.curve(to: NSPoint(x: left.maxX, y: left.minY + radius),
+                   controlPoint1: NSPoint(x: left.maxX - radius * (1 - arc), y: left.minY),
+                   controlPoint2: NSPoint(x: left.maxX, y: left.minY + radius * (1 - arc)))
+        path.line(to: NSPoint(x: left.maxX, y: left.maxY - radius))
+        path.curve(to: NSPoint(x: left.maxX - radius, y: left.maxY),
+                   controlPoint1: NSPoint(x: left.maxX, y: left.maxY - radius * (1 - arc)),
+                   controlPoint2: NSPoint(x: left.maxX - radius * (1 - arc), y: left.maxY))
+        path.close()
+        return path
+    }
+
     // MARK: Scrolling
+
+    fileprivate func handleScrollWheel(_ event: NSEvent) -> Bool {
+        guard window === event.window, !isHiddenOrHasHiddenAncestor else { return false }
+        let point = scrollView.convert(event.locationInWindow, from: nil)
+        guard scrollView.visibleRect.contains(point) else { return false }
+        scrollView.scrollWheel(with: event)
+        return true
+    }
 
     private func viewportDidScroll() {
         updateScrollAffordances()
@@ -1031,7 +1061,7 @@ final class GroupedTabStrip: NSView {
 
         var rect = items[0].frame
         for view in items.dropFirst() { rect = rect.union(view.frame) }
-        guard let image = canvas.snapshot(of: rect) else { return nil }
+        guard let image = canvas.snapshot(of: rect, clipToItem: item is GroupedTabItem) else { return nil }
         let ghost = NSImageView(image: image)
         ghost.imageScaling = .scaleNone
         ghost.wantsLayer = true
@@ -1331,14 +1361,13 @@ final class GroupedTabStrip: NSView {
 
 // MARK: - Canvas
 
-/// The scrolled document view draws connected tab feedback, separators and drop indicators.
-/// Empty space still drags the window.
+/// Rounded item feedback, group accents and drop indicators within the scrolling viewport.
 private final class GroupedTabStripCanvas: NSView {
+    weak var terminalWindow: TerminalWindow?
     var groupBlocks: [GroupedTabStrip.GroupBlock] = []
     var separatorFrame: NSRect? { didSet { needsDisplay = true } }
     var dropIndicatorX: CGFloat? { didSet { needsDisplay = true } }
     weak var selectedItem: GroupedTabItem? { didSet { needsDisplay = true } }
-    var selectionBackgroundColor: NSColor? { didSet { needsDisplay = true } }
 
     override var mouseDownCanMoveWindow: Bool { true }
     override var acceptsFirstResponder: Bool { false }
@@ -1348,6 +1377,20 @@ private final class GroupedTabStripCanvas: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        for block in groupBlocks {
+            guard let color = block.color.displayColor else { continue }
+            if block.collapsed {
+                color.setStroke()
+                let outline = NSBezierPath(roundedRect: block.rect.insetBy(dx: 0.75, dy: 0.75),
+                                           xRadius: GroupedTabStrip.Metrics.cornerRadius - 0.75,
+                                           yRadius: GroupedTabStrip.Metrics.cornerRadius - 0.75)
+                outline.lineWidth = 1.5
+                outline.stroke()
+            } else {
+                color.setFill()
+                block.gaps?.fill()
+            }
+        }
         let selection = selectedItem.flatMap { item -> NSBezierPath? in
             guard item.superview === self, item.isSelected else { return nil }
             return selectionOutline(for: item.frame)
@@ -1359,10 +1402,8 @@ private final class GroupedTabStripCanvas: NSView {
         let hover = hoveredItem.map { selectionOutline(for: $0.frame) }
 
         if let hover {
-            if let selectionBackgroundColor {
-                selectionBackgroundColor.setFill()
-                hover.fill()
-            }
+            NSColor.labelColor.withAlphaComponent(hoveredItem?.isPressed == true ? 0.10 : 0.05).setFill()
+            hover.fill()
             let emphasis: CGFloat = hoveredItem?.isDragSource == true ? 0.3 : 1
             NSColor.labelColor.withAlphaComponent((hoveredItem?.isPressed == true ? 0.16 : 0.1) * emphasis).setStroke()
             hover.lineWidth = 1 / (window?.backingScaleFactor ?? 2)
@@ -1370,14 +1411,14 @@ private final class GroupedTabStripCanvas: NSView {
         }
 
         if let selection {
-            if let selectionBackgroundColor {
-                selectionBackgroundColor.setFill()
-                selection.fill()
-            }
+            let isDark = effectiveAppearance.isDark
+            let isMain = terminalWindow?.isMainWindow == true
+            let opacity: CGFloat = isDark ? (isMain ? 0.14 : 0.08) : (isMain ? 0.85 : 0.45)
+            NSColor.white.withAlphaComponent(opacity).setFill()
+            selection.fill()
             let emphasis: CGFloat = selectedItem?.isDragSource == true ? 0.3 : 1
-            NSColor.labelColor.withAlphaComponent(0.24 * emphasis).setStroke()
+            NSColor.labelColor.withAlphaComponent((isDark ? 0.24 : 0.1) * emphasis).setStroke()
             selection.lineWidth = 1 / (window?.backingScaleFactor ?? 2)
-            // The path is deliberately open at the bottom: no line severs tab from content.
             selection.stroke()
         }
 
@@ -1387,14 +1428,13 @@ private final class GroupedTabStripCanvas: NSView {
                    width: 1, height: separatorFrame.height - 4).fill()
         }
 
-        // Match the connected tab height without clipping to the header's shorter hit target.
         for case let header as GroupedGroupHeaderItem in subviews where header.isDropTarget {
-            let rect = NSRect(x: header.frame.minX, y: bounds.minY,
-                              width: header.frame.width, height: header.frame.maxY - bounds.minY)
-            NSColor.controlAccentColor.setStroke()
-            let border = NSBezierPath(roundedRect: rect.insetBy(dx: 0.75, dy: 0.75),
-                                      xRadius: GroupedTabStrip.Metrics.cornerRadius,
-                                      yRadius: GroupedTabStrip.Metrics.cornerRadius)
+            let rect = header.frame
+            NSColor.labelColor.withAlphaComponent(0.7).setStroke()
+            let inset: CGFloat = 3.25
+            let border = NSBezierPath(roundedRect: rect.insetBy(dx: inset, dy: inset),
+                                      xRadius: GroupedTabStrip.Metrics.cornerRadius - inset,
+                                      yRadius: GroupedTabStrip.Metrics.cornerRadius - inset)
             border.lineWidth = 1.5
             border.stroke()
         }
@@ -1403,43 +1443,17 @@ private final class GroupedTabStripCanvas: NSView {
             NSColor.controlAccentColor.setFill()
             let rowBottom = bounds.maxY - GroupedTabStrip.rowHeight
             let rect = NSRect(x: dropIndicatorX - 1,
-                              y: rowBottom + (GroupedTabStrip.rowHeight - GroupedTabStrip.Metrics.itemHeight) / 2 - 2,
-                              width: 2, height: GroupedTabStrip.Metrics.itemHeight + 4)
+                              y: rowBottom + (GroupedTabStrip.rowHeight - GroupedTabStrip.Metrics.itemHeight) / 2,
+                              width: 2, height: GroupedTabStrip.Metrics.itemHeight)
             NSBezierPath(roundedRect: rect, xRadius: 1, yRadius: 1).fill()
         }
     }
 
-    /// Upper corners round inward; the lower shoulders turn outward into the content edge.
-    /// This lives on the canvas, not the 24-point item, so neither shoulder nor stem is clipped
-    /// to the hit target. The enclosing scroll view clips the whole silhouette at either end.
     private func selectionOutline(for frame: NSRect) -> NSBezierPath {
-        let pixel = 1 / (window?.backingScaleFactor ?? 2)
-        let left = frame.minX + pixel / 2
-        let right = frame.maxX - pixel / 2
-        let top = frame.maxY - pixel / 2
-        let bottom = bounds.minY
-        let radius = GroupedTabStrip.Metrics.cornerRadius
-        let shoulder = GroupedTabStrip.Metrics.shoulderRadius
-        // Cubic control distance for a quarter circle.
-        let arc: CGFloat = 0.5522847498
-        let path = NSBezierPath()
-        path.move(to: NSPoint(x: left - shoulder, y: bottom))
-        path.curve(to: NSPoint(x: left, y: bottom + shoulder),
-                   controlPoint1: NSPoint(x: left - shoulder + shoulder * arc, y: bottom),
-                   controlPoint2: NSPoint(x: left, y: bottom + shoulder - shoulder * arc))
-        path.line(to: NSPoint(x: left, y: top - radius))
-        path.curve(to: NSPoint(x: left + radius, y: top),
-                   controlPoint1: NSPoint(x: left, y: top - radius + radius * arc),
-                   controlPoint2: NSPoint(x: left + radius - radius * arc, y: top))
-        path.line(to: NSPoint(x: right - radius, y: top))
-        path.curve(to: NSPoint(x: right, y: top - radius),
-                   controlPoint1: NSPoint(x: right - radius + radius * arc, y: top),
-                   controlPoint2: NSPoint(x: right, y: top - radius + radius * arc))
-        path.line(to: NSPoint(x: right, y: bottom + shoulder))
-        path.curve(to: NSPoint(x: right + shoulder, y: bottom),
-                   controlPoint1: NSPoint(x: right, y: bottom + shoulder - shoulder * arc),
-                   controlPoint2: NSPoint(x: right + shoulder - shoulder * arc, y: bottom))
-        return path
+        let inset = 0.5 / (window?.backingScaleFactor ?? 2)
+        return NSBezierPath(roundedRect: frame.insetBy(dx: inset, dy: inset),
+                            xRadius: GroupedTabStrip.Metrics.cornerRadius - inset,
+                            yRadius: GroupedTabStrip.Metrics.cornerRadius - inset)
     }
 
     /// Scrolling moves items under a stationary pointer without tracking-area callbacks.
@@ -1451,10 +1465,22 @@ private final class GroupedTabStripCanvas: NSView {
         }
     }
 
-    func snapshot(of rect: NSRect) -> NSImage? {
+    func snapshot(of rect: NSRect, clipToItem: Bool) -> NSImage? {
         guard rect.width > 0, rect.height > 0,
               let representation = bitmapImageRepForCachingDisplay(in: rect) else { return nil }
         cacheDisplay(in: rect, to: representation)
+        if clipToItem, let context = NSGraphicsContext(bitmapImageRep: representation)?.cgContext {
+            let bounds = NSRect(origin: .zero, size: rect.size)
+            context.scaleBy(x: CGFloat(representation.pixelsWide) / rect.width,
+                            y: CGFloat(representation.pixelsHigh) / rect.height)
+            let outside = CGMutablePath()
+            outside.addRect(bounds)
+            outside.addRoundedRect(in: bounds, cornerWidth: GroupedTabStrip.Metrics.cornerRadius,
+                                   cornerHeight: GroupedTabStrip.Metrics.cornerRadius)
+            context.addPath(outside)
+            context.clip(using: .evenOdd)
+            context.clear(bounds)
+        }
         let image = NSImage(size: rect.size)
         image.addRepresentation(representation)
         return image
@@ -1743,6 +1769,7 @@ private final class GroupedGroupHeaderItem: GroupedStripItem {
     private(set) var name = ""
     private(set) var isActive = false
     private(set) var memberCount = 0
+    private(set) var color: TerminalTabColor = .none
     private var labelWidth: CGFloat = 0
 
     var titleFont: NSFont? {
@@ -1771,7 +1798,8 @@ private final class GroupedGroupHeaderItem: GroupedStripItem {
             toolTip = name
         }
         isActive = group.isActive
-        label.textColor = isActive ? .controlAccentColor : .secondaryLabelColor
+        color = group.color
+        label.textColor = isActive ? .labelColor : .secondaryLabelColor
         memberCount = group.tabs.count
         needsLayout = true
         needsDisplay = true
@@ -1799,9 +1827,13 @@ private final class GroupedGroupHeaderItem: GroupedStripItem {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        if isHovered || isPressed {
+            NSColor.labelColor.withAlphaComponent(isPressed ? 0.10 : 0.05).setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: Metrics.cornerRadius, yRadius: Metrics.cornerRadius).fill()
+        }
         let chevronRect = NSRect(x: Metrics.horizontalPadding, y: 0, width: Metrics.chevronWidth, height: bounds.height)
         Self.drawChevron(in: chevronRect, down: isActive,
-                         color: isPressed || isHovered ? .labelColor : .controlAccentColor)
+                         color: isPressed || isHovered || isActive ? .labelColor : .secondaryLabelColor)
     }
 
     private static func drawChevron(in rect: NSRect, down: Bool, color: NSColor) {

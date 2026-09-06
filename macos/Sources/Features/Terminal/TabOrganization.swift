@@ -17,6 +17,7 @@ final class TabOrganization {
     struct GroupPresentation: Identifiable, Equatable {
         let id: UUID
         let name: String
+        let color: TerminalTabColor
         let tabs: [TabPresentation]
         let isActive: Bool
     }
@@ -34,6 +35,7 @@ final class TabOrganization {
         case activateGroup(UUID)
         case createGroup(tabID: UUID)
         case renameGroup(UUID)
+        case setGroupColor(groupID: UUID, color: TerminalTabColor)
         case deleteGroup(UUID)
         case moveTab(tabID: UUID, groupID: UUID?, index: Int?)
         case moveGroup(groupID: UUID, index: Int)
@@ -621,7 +623,8 @@ final class TabOrganization {
         let groups = record?.groups.compactMap { group -> GroupPresentation? in
             let tabs = group.tabIDs.compactMap { byID[$0] }
             guard !tabs.isEmpty else { return nil }
-            return .init(id: group.id, name: group.name, tabs: tabs, isActive: tabs.contains(where: \.isSelected))
+            return .init(id: group.id, name: group.name, color: group.color,
+                         tabs: tabs, isActive: tabs.contains(where: \.isSelected))
         } ?? []
         let grouped = Set(groups.flatMap { $0.tabs.map(\.id) })
         let unassigned = windows.compactMap { $0.terminalController?.organizationIdentity.tabID }
@@ -655,6 +658,7 @@ final class TabOrganization {
                 guard let self, let window else { return }
                 _ = self.renameGroup(id, name: name, in: window)
             }
+        case .setGroupColor(let id, let color): _ = setGroupColor(id, color: color, in: window)
         case .deleteGroup(let id): promptDeletion(id, in: window)
         case .moveTab(let id, let groupID, let index): _ = moveTab(id, to: groupID, index: index, in: window)
         case .moveGroup(let id, let index): _ = moveGroup(id, index: index, in: window)
@@ -691,6 +695,14 @@ final class TabOrganization {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, var record = record(for: window), let index = record.groups.firstIndex(where: { $0.id == groupID }) else { return false }
         record.groups[index].name = name
+        return commit(record, in: window)
+    }
+
+    @discardableResult
+    func setGroupColor(_ groupID: UUID, color: TerminalTabColor, in window: TerminalWindow) -> Bool {
+        flush()
+        guard var record = record(for: window), let index = record.groups.firstIndex(where: { $0.id == groupID }) else { return false }
+        record.groups[index].color = color
         return commit(record, in: window)
     }
 
@@ -845,6 +857,15 @@ final class TabOrganization {
         guard let record = record(for: window), let index = record.groups.firstIndex(where: { $0.id == groupID }) else { return menu }
         menu.addItem(MenuItem("Activate Group", action: .activateGroup(groupID), window: window))
         menu.addItem(MenuItem("Rename Group...", action: .renameGroup(groupID), window: window))
+        let colorItems = makeTabColorPaletteItems(
+            title: "Group Color",
+            selectedColor: record.groups[index].color
+        ) { [weak window] color in
+            guard let window else { return }
+            TabOrganization.shared.perform(.setGroupColor(groupID: groupID, color: color), in: window)
+        }
+        menu.addItem(colorItems.heading)
+        menu.addItem(colorItems.palette)
         if index > 0 { menu.addItem(MenuItem("Move Group Left", action: .moveGroup(groupID: groupID, index: index - 1), window: window)) }
         if index + 1 < record.groups.count { menu.addItem(MenuItem("Move Group Right", action: .moveGroup(groupID: groupID, index: index + 1), window: window)) }
         menu.addItem(.separator())
@@ -962,15 +983,21 @@ final class TabOrganization {
 
         static func restore(_ tabID: UUID, context: UndoContext, in window: inout TabOrganizationState.Window) {
             let selected = window.selectedTabID
+            // A repeated Undo must retain a surviving owner's current metadata and position.
+            let survivingGroupIndex = context.group.flatMap { original in
+                window.groups.firstIndex(where: { $0.id == original.id })
+            }
+            let group = survivingGroupIndex.map { window.groups[$0] } ?? context.group
             remove(tabID, from: &window)
-            if let original = context.group {
+            if let original = group {
                 if let index = window.groups.firstIndex(where: { $0.id == original.id }) {
                     window.groups[index].tabIDs.insert(tabID, at: min(context.tabIndex, window.groups[index].tabIDs.count))
                 } else {
                     var group = original
                     group.tabIDs = [tabID]
                     group.lastSelectedTabID = tabID
-                    window.groups.insert(group, at: min(context.groupIndex ?? window.groups.count, window.groups.count))
+                    window.groups.insert(group, at: min(
+                        survivingGroupIndex ?? context.groupIndex ?? window.groups.count, window.groups.count))
                 }
             } else {
                 window.unassigned.insert(tabID, at: min(context.tabIndex, window.unassigned.count))
