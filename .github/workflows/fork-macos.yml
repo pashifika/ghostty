@@ -1,0 +1,91 @@
+name: Fork macOS
+
+on:
+  pull_request:
+    branches:
+      - fork/macos-tabs
+  push:
+    branches:
+      - feat/macos-only-tab-organization-in-an-integrated-titlebar
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    if: github.repository == 'pashifika/ghostty'
+    name: macOS compile and unit tests
+    # Standard GitHub-hosted Apple Silicon runner; no upstream runner or secrets.
+    runs-on: macos-26
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      XCODE_PATH: /Applications/Xcode_26.2.app/Contents/Developer
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Install build tools
+        run: |
+          brew install gettext
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+          DEVELOPER_DIR="$XCODE_PATH" xcodebuild -downloadComponent metalToolchain
+
+      - name: Show toolchain versions
+        run: |
+          zig version
+          DEVELOPER_DIR="$XCODE_PATH" xcodebuild -version
+
+      # A nonempty filter keeps Zig's test step from invoking its Xcode wrapper,
+      # which clears DEVELOPER_DIR. Swift tests run directly below instead.
+      - name: Run Zig configuration tests
+        run: |
+          DEVELOPER_DIR="$XCODE_PATH" zig build test -j2 \
+            -Dtest-filter=config. \
+            -Demit-macos-app=false \
+            -Demit-docs=false \
+            --summary all
+
+      # Keep the native framework and resources expected by the Xcode project.
+      # Use the existing docs-disabled build path; release docs are out of scope.
+      - name: Build native GhosttyKit
+        run: |
+          DEVELOPER_DIR="$XCODE_PATH" zig build -j2 \
+            -Dxcframework-target=native \
+            -Demit-macos-app=false \
+            -Demit-docs=false \
+            --summary all
+
+      # Compile/unit coverage only: native titlebar layout, tab interactions,
+      # and relaunch restoration still require local GUI acceptance.
+      # The unsigned test host must not enable hardened-runtime library checks.
+      - name: Build macOS app and run GhosttyTests
+        run: |
+          DEVELOPER_DIR="$XCODE_PATH" xcodebuild test \
+            -project macos/Ghostty.xcodeproj \
+            -scheme Ghostty \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            -only-testing:GhosttyTests \
+            -parallel-testing-enabled NO \
+            -disableAutomaticPackageResolution \
+            -derivedDataPath "$RUNNER_TEMP/GhosttyDerivedData" \
+            -resultBundlePath "$RUNNER_TEMP/GhosttyTests.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            ENABLE_HARDENED_RUNTIME=NO
