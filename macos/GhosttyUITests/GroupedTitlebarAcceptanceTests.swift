@@ -3,6 +3,146 @@ import XCTest
 
 final class GroupedTitlebarAcceptanceTests: GhosttyCustomConfigCase {
     @MainActor
+    func testAutomaticTabWidthsFillAndReallocateThroughNativeTransitions() throws {
+        let app = try launchGrouped()
+        defer { app.terminate() }
+        let shortTitle = "A"
+        let longTitle = "A considerably longer terminal title"
+        try nameTab(shortTitle, in: app)
+        let window = app.windows.firstMatch
+        let newTab = app.toolbars.buttons["New Tab"].firstMatch
+        XCTAssertTrue(newTab.isHittable)
+        let initialPlusFrame = newTab.frame
+        let initialWidth = window.frame.width
+        let plusRightInset = window.frame.maxX - newTab.frame.maxX
+        capture("Automatic allocation - one tab fills the windowed strip", app: app)
+        try assertEqualTabWidths([shortTitle], in: app)
+
+        newTab.click()
+        try nameTab(longTitle, in: app)
+        capture("Automatic allocation - differing titles share the windowed strip", app: app)
+        try assertEqualTabWidths([shortTitle, longTitle], in: app)
+        XCTAssertEqual(newTab.frame, initialPlusFrame)
+        let leadingFrame = tab(shortTitle, in: app).frame
+        app.toolbars.scrollViews.firstMatch.hover()
+        app.toolbars.scrollViews.firstMatch.scroll(byDeltaX: -80, deltaY: 0)
+        XCTAssertEqual(tab(shortTitle, in: app).frame, leadingFrame, "A fitting strip must not have a scrollable tail")
+
+        let resizeGrip = window.coordinate(withNormalizedOffset: CGVector(dx: 0.998, dy: 0.8))
+        resizeGrip.press(forDuration: 0.1, thenDragTo: resizeGrip.withOffset(CGVector(dx: -120, dy: 0)))
+        XCTAssertLessThan(window.frame.width, initialWidth - 60)
+        XCTAssertEqual(window.frame.maxX - newTab.frame.maxX, plusRightInset, accuracy: 1)
+        capture("Automatic allocation - equal tabs after narrowing", app: app)
+        try assertEqualTabWidths([shortTitle, longTitle], in: app)
+
+        let windowedFrame = window.frame
+        app.typeKey("f", modifierFlags: [.command, .control])
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0)).hover()
+        let fullscreen = NSPredicate { _, _ in window.frame.width > windowedFrame.width }
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: fullscreen, object: window)],
+                                     timeout: 5), .completed)
+        capture("Automatic allocation - equal tabs in native fullscreen", app: app, fullScreen: true)
+        try assertEqualTabWidths([shortTitle, longTitle], in: app)
+        app.typeKey("f", modifierFlags: [.command, .control])
+        XCTAssertTrue(app.wait(for: \.windows.firstMatch.frame, toEqual: windowedFrame, timeout: 5))
+        try assertEqualTabWidths([shortTitle, longTitle], in: app)
+
+        let restoreGrip = window.coordinate(withNormalizedOffset: CGVector(dx: 0.998, dy: 0.8))
+        restoreGrip.press(forDuration: 0.1, thenDragTo: restoreGrip.withOffset(
+            CGVector(dx: initialWidth - window.frame.width, dy: 0)))
+        XCTAssertGreaterThan(window.frame.width, windowedFrame.width + 60)
+        try assertEqualTabWidths([shortTitle, longTitle], in: app)
+        let restoredPlusFrame = newTab.frame
+        app.typeKey("w", modifierFlags: .command)
+        XCTAssertTrue(tab(longTitle, in: app).waitForNonExistence(timeout: 5))
+        capture("Automatic allocation - removing a tab restores full width", app: app)
+        try assertEqualTabWidths([shortTitle], in: app)
+        XCTAssertEqual(newTab.frame, restoredPlusFrame)
+        try nameTab("Allocation Survivor", in: app)
+    }
+
+    @MainActor
+    func testShortGroupLabelRendersFullyAfterRenameAndConstraintRelease() throws {
+        let app = try launchGrouped()
+        defer { app.terminate() }
+        let longName = "A deliberately long group name before renaming"
+        try nameTab("Member 1", in: app)
+        try createGroup(longName, from: "Member 1", in: app)
+        for index in 2...8 {
+            app.toolbars.buttons["New Tab"].firstMatch.click()
+            try nameTab("Member \(index)", in: app)
+        }
+        app.typeKey("1", modifierFlags: .command)
+        let leftArrow = app.toolbars.buttons["Scroll tabs left"].firstMatch
+        if leftArrow.exists { leftArrow.click() }
+        XCTAssertTrue(app.toolbars.buttons["Scroll tabs right"].firstMatch.waitForExistence(timeout: 5))
+        capture("Short-label recovery - constrained long header", app: app)
+
+        header(longName, in: app).rightClick()
+        app.windows.menus.menuItems["Rename Group..."].firstMatch.click()
+        let field = app.sheets.textFields["Group name"].firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        field.typeKey("a", modifierFlags: .command)
+        field.typeText("Github")
+        app.sheets.buttons["Save"].firstMatch.click()
+        XCTAssertTrue(header("Github", in: app).waitForExistence(timeout: 5))
+        capture("Short-label recovery - Github renamed while constrained", app: app)
+
+        tab("Member 1", in: app).rightClick()
+        app.windows.menus.menuItems["Close Other Tabs"].firstMatch.click()
+        XCTAssertTrue(app.wait(for: \.toolbars.tabs.count, toEqual: 1, timeout: 5))
+        XCTAssertTrue(leftArrow.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(app.toolbars.buttons["Scroll tabs right"].firstMatch.waitForNonExistence(timeout: 5))
+        capture("Short-label recovery - full Github beside an expanded tab", app: app)
+        try assertRenderedHeader("Github", in: app)
+        try assertEqualTabWidths(["Member 1"], leadingHeader: "Github", in: app)
+        let preferredHeaderWidth = header("Github", in: app).frame.width
+        let newTab = app.toolbars.buttons["New Tab"].firstMatch
+        let fixedPlusFrame = newTab.frame
+
+        newTab.click()
+        let unassignedTitle = "A longer unassigned terminal"
+        try nameTab(unassignedTitle, in: app)
+        tab(unassignedTitle, in: app).rightClick()
+        app.windows.menus.menuItems["Move to Group"].firstMatch.hover()
+        app.windows.menus.menuItems["Unassigned"].firstMatch.click()
+        XCTAssertTrue(tab("Member 1", in: app).waitForNonExistence(timeout: 5))
+        capture("Short-label recovery - collapsed Github and one visible unassigned tab", app: app)
+        try assertRenderedHeader("Github", in: app)
+        try assertEqualTabWidths([unassignedTitle], leadingHeader: "Github", in: app)
+        XCTAssertEqual(header("Github", in: app).frame.width, preferredHeaderWidth)
+
+        header("Github", in: app).click()
+        XCTAssertTrue(tab("Member 1", in: app).waitForExistence(timeout: 5))
+        capture("Short-label recovery - full Github and equal mixed-membership tabs", app: app)
+        try assertRenderedHeader("Github", in: app)
+        try assertEqualTabWidths(["Member 1", unassignedTitle], leadingHeader: "Github", in: app)
+        XCTAssertEqual(header("Github", in: app).frame.width, preferredHeaderWidth)
+        XCTAssertEqual(newTab.frame, fixedPlusFrame)
+        header("Github", in: app).rightClick()
+        app.windows.menus.menuItems["Rename Group..."].firstMatch.click()
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        XCTAssertEqual(field.value as? String, "Github")
+        app.sheets.buttons["Cancel"].firstMatch.click()
+
+        let config = try String(contentsOf: XCTUnwrap(configFile), encoding: .utf8)
+        try updateConfig(config + "\nwindow-title-font-family = Helvetica\n")
+        app.typeKey(",", modifierFlags: [.command, .shift])
+        let fontChanged = NSPredicate { _, _ in
+            self.header("Github", in: app).frame.width != preferredHeaderWidth
+        }
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: fontChanged, object: app)],
+                                     timeout: 5), .completed)
+        capture("Short-label recovery - full Github after font reload", app: app)
+        try assertRenderedHeader("Github", in: app)
+        try assertEqualTabWidths(["Member 1", unassignedTitle], leadingHeader: "Github", in: app)
+        try updateConfig(config)
+        app.typeKey(",", modifierFlags: [.command, .shift])
+        XCTAssertTrue(header("Github", in: app).wait(for: \.frame.width, toEqual: preferredHeaderWidth, timeout: 5))
+        try assertRenderedHeader("Github", in: app)
+    }
+
+    @MainActor
     func testTerminalScrollbackInWindowedAndFullscreenGroups() throws {
         let app = try launchTwoMembers()
         defer { app.terminate() }
@@ -611,6 +751,57 @@ final class GroupedTitlebarAcceptanceTests: GhosttyCustomConfigCase {
         app.typeKey(.escape, modifierFlags: [])
         try nameTab("Shared Menu Survivor", in: app)
         capture("Shared native menu targets and one-tab validation", app: app)
+    }
+
+    @MainActor
+    private func assertEqualTabWidths(
+        _ titles: [String],
+        leadingHeader: String? = nil,
+        in app: XCUIApplication
+    ) throws {
+        XCTAssertEqual(app.toolbars.tabs.count, titles.count)
+        let viewport = app.toolbars.scrollViews.firstMatch
+        XCTAssertTrue(viewport.exists)
+        let image = viewport.screenshot().image
+        let pixelsWide = try XCTUnwrap(image.representations.map(\.pixelsWide).max())
+        XCTAssertGreaterThan(pixelsWide, 0)
+        let backingPixel = viewport.frame.width / CGFloat(pixelsWide)
+        let first = tab(try XCTUnwrap(titles.first), in: app)
+        let last = tab(try XCTUnwrap(titles.last), in: app)
+        XCTAssertTrue(first.isHittable)
+        let leading = leadingHeader.map { header($0, in: app) } ?? first
+        let leadingInset = leading.frame.minX - viewport.frame.minX
+        XCTAssertGreaterThanOrEqual(leadingInset, 0)
+        XCTAssertEqual(viewport.frame.maxX - last.frame.maxX, leadingInset, accuracy: backingPixel,
+                       "Visible tabs must fill the viewport up to its matching trailing inset")
+        for title in titles.dropFirst() {
+            let item = tab(title, in: app)
+            XCTAssertTrue(item.isHittable)
+            XCTAssertEqual(item.frame.width, first.frame.width, accuracy: backingPixel,
+                           "Different terminal titles must receive equal available widths")
+        }
+        XCTAssertFalse(app.toolbars.buttons["Scroll tabs left"].firstMatch.exists)
+        XCTAssertFalse(app.toolbars.buttons["Scroll tabs right"].firstMatch.exists)
+        XCTAssertTrue(app.toolbars.buttons["New Tab"].firstMatch.isHittable)
+    }
+
+    @MainActor
+    private func assertRenderedHeader(_ name: String, in app: XCUIApplication) throws {
+        let item = header(name, in: app)
+        XCTAssertTrue(item.isHittable)
+        let screenshot = item.screenshot()
+        let attachment = XCTAttachment(screenshot: screenshot)
+        attachment.name = "Rendered group label - \(name)"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages = ["en-US"]
+        request.usesLanguageCorrection = false
+        try VNImageRequestHandler(data: screenshot.pngRepresentation).perform([request])
+        let rendered = request.results?.compactMap { $0.topCandidates(1).first?.string } ?? []
+        let words = rendered.flatMap { $0.split(whereSeparator: \.isWhitespace).map(String.init) }
+        XCTAssertTrue(words.contains(name), "Expected the full rendered group name \(name); OCR found \(rendered)")
     }
 
     @MainActor

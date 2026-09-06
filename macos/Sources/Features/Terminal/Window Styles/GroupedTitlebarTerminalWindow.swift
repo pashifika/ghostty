@@ -313,7 +313,6 @@ final class GroupedTabStrip: NSView {
         static let chevronWidth: CGFloat = 10
         static let closeButtonSize: CGFloat = 16
         static let tabMinLabelWidth: CGFloat = 36
-        static let tabMaxLabelWidth: CGFloat = 160
         static let groupMinLabelWidth: CGFloat = 48
         static let groupMaxLabelWidth: CGFloat = 140
         static let memberSpacing: CGFloat = 3
@@ -566,6 +565,11 @@ final class GroupedTabStrip: NSView {
         needsLayout = true
     }
 
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        needsLayout = true
+    }
+
     override func layout() {
         super.layout()
         needsDisplay = true
@@ -600,65 +604,113 @@ final class GroupedTabStrip: NSView {
         canvas.syncHover()
     }
 
-    /// Width-based layout: every label gets its natural width up to a maximum; when the row is
-    /// constrained, labels shrink proportionally down to their minimum (the framework truncates
-    /// the tail); only when the minimums still do not fit does the row scroll.
+    /// Compact headers reserve their preferred widths; visible tabs equally fill the remainder.
+    /// Headers compress before aggregate minima require scrolling.
     private func layoutCanvas() {
         var viewport = scrollView.contentSize.width
         guard viewport > 0 else { return }
         let scale = window?.backingScaleFactor ?? 2
+        let inset = Int(ceil(Metrics.canvasInset * scale))
 
-        var naturals: [CGFloat] = []
-        var minimums: [CGFloat] = []
-        var fixed = Metrics.canvasInset * 2
+        var widths: [Int] = []
+        widths.reserveCapacity(entries.count)
+        var fixed = inset * 2
+        var headerCapacity = 0
+        var tabCount = 0
+        var tabMinimumTotal = 0
+        var widestTabMinimum = 0
         for (index, entry) in entries.enumerated() {
             switch entry {
             case .group(let header):
-                naturals.append(header.naturalWidth)
-                minimums.append(header.minimumWidth)
+                let width = Int(ceil(header.naturalWidth * scale))
+                widths.append(width)
+                headerCapacity += width - Int(ceil(header.minimumWidth * scale))
             case .tab(let tab, _):
-                naturals.append(tab.naturalWidth)
-                minimums.append(tab.minimumWidth)
+                let width = Int(ceil(tab.minimumWidth * scale))
+                widths.append(width)
+                tabCount += 1
+                tabMinimumTotal += width
+                widestTabMinimum = max(widestTabMinimum, width)
             case .separator:
-                naturals.append(Metrics.separatorWidth)
-                minimums.append(Metrics.separatorWidth)
+                widths.append(Int(ceil(Metrics.separatorWidth * scale)))
             }
-            if index > 0 { fixed += Self.spacing(between: entries[index - 1], and: entry) }
+            if index > 0 {
+                fixed += Int(ceil(Self.spacing(between: entries[index - 1], and: entry) * scale))
+            }
         }
 
-        let naturalTotal = naturals.reduce(0, +) + fixed
-        let minimumTotal = minimums.reduce(0, +) + fixed
-        if minimumTotal > viewport + 0.5 {
-            // Reserve both edge slots while overflowing, independent of arrow visibility.
+        let preferredTotal = widths.reduce(0, +) + fixed
+        let minimumTotal = preferredTotal - headerCapacity
+        let overflows = minimumTotal > Int(floor(viewport * scale))
+        if overflows {
+            // Reserve both edge slots based on the full viewport, never on arrow visibility.
             scrollView.frame = scrollView.frame.insetBy(dx: Metrics.scrollButtonWidth, dy: 0)
             viewport = scrollView.contentSize.width
         }
-        var widths = naturals
-        if naturalTotal > viewport {
-            let shrinkable = naturalTotal - minimumTotal
-            if shrinkable > 0 {
-                let ratio = min(1, (naturalTotal - viewport) / shrinkable)
-                for index in widths.indices {
-                    widths[index] = naturals[index] - (naturals[index] - minimums[index]) * ratio
+        let viewportPixels = Int(floor(viewport * scale))
+        let shrink = min(headerCapacity, max(0, preferredTotal - viewportPixels))
+        if shrink > 0 {
+            var remainingShrink = shrink
+            var remainingCapacity = headerCapacity
+            for (index, entry) in entries.enumerated() {
+                guard case .group(let header) = entry else { continue }
+                let capacity = widths[index] - Int(ceil(header.minimumWidth * scale))
+                guard capacity > 0 else { continue }
+                let reduction = remainingShrink * capacity / remainingCapacity
+                widths[index] -= reduction
+                remainingShrink -= reduction
+                remainingCapacity -= capacity
+            }
+        }
+
+        if !overflows && tabCount > 0 {
+            var remainingPixels = viewportPixels - (preferredTotal - shrink - tabMinimumTotal)
+            var remainingCount = tabCount
+            var share = remainingPixels / remainingCount
+            if widestTabMinimum > share {
+                // Clamp the largest minima first; only the unconstrained tabs share what remains.
+                var minimums: [Int] = []
+                minimums.reserveCapacity(tabCount)
+                for (entry, width) in zip(entries, widths) {
+                    if case .tab = entry { minimums.append(width) }
+                }
+                minimums.sort(by: >)
+                for minimum in minimums {
+                    guard minimum > remainingPixels / remainingCount else { break }
+                    remainingPixels -= minimum
+                    remainingCount -= 1
+                }
+                share = remainingPixels / remainingCount
+            }
+            var remainder = remainingPixels % remainingCount
+            for (index, entry) in entries.enumerated() {
+                guard case .tab = entry, widths[index] <= share else { continue }
+                widths[index] = share
+                if remainder > 0 {
+                    widths[index] += 1
+                    remainder -= 1
                 }
             }
         }
 
         var frames: [NSRect] = []
+        frames.reserveCapacity(entries.count)
         var separatorFrame: NSRect?
-        var x = Metrics.canvasInset
+        var x = inset
         let y = rowBounds.minY + (Self.rowHeight - Metrics.itemHeight) / 2
         for (index, entry) in entries.enumerated() {
-            if index > 0 { x += Self.spacing(between: entries[index - 1], and: entry) }
-            let width = floor(widths[index] * scale) / scale
-            let frame = NSRect(x: x, y: y, width: width, height: Metrics.itemHeight)
+            if index > 0 {
+                x += Int(ceil(Self.spacing(between: entries[index - 1], and: entry) * scale))
+            }
+            let frame = NSRect(x: CGFloat(x) / scale, y: y,
+                               width: CGFloat(widths[index]) / scale, height: Metrics.itemHeight)
             frames.append(frame)
             if case .separator = entry { separatorFrame = frame }
-            x += width
+            x += widths[index]
         }
         entryFrames = frames
 
-        let contentWidth = ceil(x + Metrics.canvasInset)
+        let contentWidth = CGFloat(x + inset) / scale
         canvas.frame = NSRect(x: 0, y: 0, width: max(contentWidth, viewport), height: bounds.height)
         for (entry, frame) in zip(entries, frames) {
             entry.view?.frame = frame
@@ -1542,14 +1594,13 @@ private class GroupedStripItem: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     // Subclass surface.
-    var naturalWidth: CGFloat { 0 }
     var minimumWidth: CGFloat { 0 }
     var itemTitle: String { "" }
     func performPrimaryAction() {}
 
     var naturalLabelWidth: CGFloat {
         // The cell includes text insets that attributed-string measurement omits.
-        ceil(label.cell?.cellSize.width ?? label.intrinsicContentSize.width)
+        label.cell?.cellSize.width ?? label.intrinsicContentSize.width
     }
 
     // MARK: NSView
@@ -1719,7 +1770,6 @@ private final class GroupedTabItem: GroupedStripItem {
         return width
     }
 
-    override var naturalWidth: CGFloat { chromeWidth + min(labelWidth, Metrics.tabMaxLabelWidth) }
     override var minimumWidth: CGFloat { chromeWidth + min(labelWidth, Metrics.tabMinLabelWidth) }
 
     override func layout() {
@@ -1816,8 +1866,10 @@ private final class GroupedGroupHeaderItem: GroupedStripItem {
         Metrics.horizontalPadding * 2 + Metrics.chevronWidth + Metrics.iconSpacing
     }
 
-    override var naturalWidth: CGFloat { chromeWidth + min(labelWidth, Metrics.groupMaxLabelWidth) }
-    override var minimumWidth: CGFloat { chromeWidth + min(labelWidth, Metrics.groupMinLabelWidth) }
+    var naturalWidth: CGFloat {
+        chromeWidth + max(Metrics.groupMinLabelWidth, min(labelWidth, Metrics.groupMaxLabelWidth))
+    }
+    override var minimumWidth: CGFloat { chromeWidth + Metrics.groupMinLabelWidth }
 
     override func layout() {
         super.layout()
