@@ -38,29 +38,51 @@ struct GroupedTabStripLayoutTests {
         strip.layout()
         let scroll = try #require(strip.subviews.compactMap { $0 as? NSScrollView }.first)
         let canvas = try #require(scroll.documentView)
+        try #require(canvas.frame.width > scroll.contentSize.width)
         let minimumWidths = canvas.subviews.map { $0.frame.width }
         let minimumContentWidth = canvas.frame.width
         strip.setFrameSize(NSSize(width: 600, height: 28))
         strip.layout()
+        let fullViewportFrame = scroll.frame
         let fixedChrome = strip.frame.width - scroll.frame.width
         let fitWidth = minimumContentWidth + fixedChrome
-        for delta: CGFloat in [-0.5, 0, 0.5, 0.75, 1, 1.5] {
+        var availableWidths: [CGFloat] = []
+        var exercisedResidualPixels = false
+        for delta: CGFloat in [-1, -0.5, 0, 0.5, 0.75, 1, 1.5] {
             strip.setFrameSize(NSSize(width: fitWidth + delta, height: 28))
+            // Sample AppKit's full viewport before layout reserves any overflow controls.
+            var viewportFrame = fullViewportFrame
+            viewportFrame.size.width = strip.bounds.width - fixedChrome
+            scroll.frame = viewportFrame
+            let availableWidth = scroll.contentSize.width
+            availableWidths.append(availableWidth)
             strip.layout()
             let items = canvas.subviews
             for (item, minimum) in zip(items, minimumWidths) {
                 #expect(item.frame.width >= minimum)
             }
-            if delta < 0 {
+            if availableWidth < minimumContentWidth {
                 #expect(canvas.frame.width > scroll.contentSize.width)
             } else {
+                #expect(scroll.contentSize.width == availableWidth)
                 #expect(canvas.frame.width == scroll.contentSize.width)
                 let first = try #require(items.first)
                 let last = try #require(items.last)
                 #expect(abs(first.frame.minX - (canvas.frame.maxX - last.frame.maxX)) < 0.5)
-                #expect(items.map { $0.frame.width }.max()! - items.map { $0.frame.width }.min()! <= 0.5)
+                let widths = items.map { $0.frame.width }
+                let widthDifference = widths.max()! - widths.min()!
+                #expect(widthDifference <= 0.5)
+                let sparePixels = Int(floor(availableWidth * 2)) - Int(minimumContentWidth * 2)
+                if sparePixels % tabs.count != 0 {
+                    exercisedResidualPixels = true
+                    #expect(widthDifference == 0.5)
+                }
             }
         }
+        #expect(availableWidths.contains { $0 < minimumContentWidth })
+        #expect(availableWidths.contains(minimumContentWidth))
+        #expect(availableWidths.contains { $0 > minimumContentWidth })
+        #expect(exercisedResidualPixels)
     }
 
     @Test func compactHeadersRemainUsableWithoutVisibleMembers() throws {
