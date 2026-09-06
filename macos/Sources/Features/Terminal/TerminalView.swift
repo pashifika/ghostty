@@ -76,7 +76,10 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                     // If we're running in debug mode we show a warning so that users
                     // know that performance will be degraded.
                     if Ghostty.info.mode == GHOSTTY_BUILD_MODE_DEBUG || Ghostty.info.mode == GHOSTTY_BUILD_MODE_RELEASE_SAFE {
-                        DebugBuildWarningView()
+                        DebugBuildWarningView(
+                            backgroundColor: ghostty.config.macosTitlebarStyle == .groups
+                                ? .clear
+                                : Color(.windowBackgroundColor))
                     }
 
                     TerminalSplitTreeView(
@@ -145,6 +148,10 @@ private struct UpdateOverlay: View {
 }
 
 struct DebugBuildWarningView: View {
+    // Connected tabs share the window's terminal backing through this warning, not a separate
+    // system-colored band. Other titlebar styles retain their existing warning background.
+    let backgroundColor: Color
+
     @State private var isPopover = false
 
     var body: some View {
@@ -167,7 +174,7 @@ struct DebugBuildWarningView: View {
 
             Spacer()
         }
-        .background(Color(.windowBackgroundColor))
+        .background(backgroundColor)
         .frame(maxWidth: .infinity)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Debug build warning")

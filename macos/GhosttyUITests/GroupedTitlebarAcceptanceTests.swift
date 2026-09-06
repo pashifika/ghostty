@@ -88,6 +88,62 @@ final class GroupedTitlebarAcceptanceTests: GhosttyCustomConfigCase {
     }
 
     @MainActor
+    func testConnectedSelectionAndNewTabInWindowedAndNativeFullscreen() throws {
+        let app = try launchGrouped()
+        defer { app.terminate() }
+        try nameTab("Alpha", in: app)
+        try createGroup("Project", from: "Alpha", in: app)
+        let newTab = app.toolbars.buttons["New Tab"].firstMatch
+        XCTAssertTrue(newTab.isHittable)
+        newTab.click()
+        try nameTab("Beta", in: app)
+        XCTAssertEqual(app.toolbars.tabs.count, 2)
+
+        tab("Alpha", in: app).click()
+        try nameTab("Alpha Selected", in: app)
+        XCTAssertTrue(tab("Beta", in: app).exists)
+        capture("Connected active tab - windowed first selected", app: app)
+        tab("Beta", in: app).hover()
+        XCTAssertEqual(tab("Alpha Selected", in: app).value as? Int, 1)
+        XCTAssertEqual(tab("Beta", in: app).value as? Int, 0)
+        capture("Connected inactive hover beside selected tab", app: app)
+        newTab.hover()
+        capture("Connected inactive hover cleared without selection change", app: app)
+        tab("Beta", in: app).click()
+        try nameTab("Beta Selected", in: app)
+        XCTAssertTrue(tab("Alpha Selected", in: app).exists)
+        capture("Connected active tab - windowed second selected", app: app)
+
+        let windowedFrame = app.windows.firstMatch.frame
+        app.typeKey("f", modifierFlags: [.command, .control])
+        app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0)).hover()
+        tab("Alpha Selected", in: app).click()
+        try nameTab("Alpha Fullscreen", in: app)
+        XCTAssertGreaterThan(app.windows.firstMatch.frame.width, windowedFrame.width)
+        XCTAssertTrue(tab("Beta Selected", in: app).exists)
+        capture("Connected active tab - native fullscreen first selected", app: app, fullScreen: true)
+        tab("Beta Selected", in: app).hover()
+        XCTAssertEqual(tab("Alpha Fullscreen", in: app).value as? Int, 1)
+        XCTAssertEqual(tab("Beta Selected", in: app).value as? Int, 0)
+        capture("Connected inactive hover in native fullscreen", app: app, fullScreen: true)
+        tab("Beta Selected", in: app).click()
+        try nameTab("Beta Fullscreen", in: app)
+        XCTAssertTrue(tab("Alpha Fullscreen", in: app).exists)
+        capture("Connected active tab - native fullscreen second selected", app: app, fullScreen: true)
+
+        XCTAssertTrue(newTab.isHittable)
+        newTab.click()
+        try nameTab("Fullscreen New Tab", in: app)
+        XCTAssertEqual(app.toolbars.tabs.count, 3)
+        XCTAssertTrue(tab("Alpha Fullscreen", in: app).exists)
+        XCTAssertTrue(tab("Beta Fullscreen", in: app).exists)
+        capture("Connected active tab - native fullscreen plus creates a usable terminal", app: app, fullScreen: true)
+        app.typeKey("f", modifierFlags: [.command, .control])
+        XCTAssertTrue(app.wait(for: \.windows.firstMatch.frame, toEqual: windowedFrame, timeout: 5))
+        try nameTab("Windowed Input Survived", in: app)
+    }
+
+    @MainActor
     func testHiddenCloseButtonsReloadAndFullscreenContextClose() throws {
         let app = try launchTwoMembers()
         defer { app.terminate() }
@@ -293,6 +349,12 @@ final class GroupedTitlebarAcceptanceTests: GhosttyCustomConfigCase {
         XCTAssertTrue(tab("Terminal 1", in: app).isHittable)
         XCTAssertTrue(app.toolbars.buttons["Scroll tabs right"].firstMatch.exists)
         capture("Long full-name group label and horizontally overflowing single row", app: app)
+        app.toolbars.buttons["Scroll tabs right"].firstMatch.click()
+        XCTAssertTrue(tab("Terminal 8", in: app).isHittable)
+        capture("Borderless scroll controls reveal trailing tabs", app: app)
+        app.toolbars.buttons["Scroll tabs left"].firstMatch.click()
+        XCTAssertTrue(tab("Terminal 1", in: app).isHittable)
+        XCTAssertEqual(tab("Terminal 1", in: app).value as? Int, 1)
         header(name, in: app).rightClick()
         app.windows.menus.menuItems["Rename Group..."].firstMatch.click()
         let field = app.sheets.textFields["Group name"].firstMatch
