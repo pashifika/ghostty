@@ -48,6 +48,27 @@ class TerminalRestorableState: TerminalRestorable {
     let effectiveFullscreenMode: FullscreenMode?
     let tabColor: TerminalTabColor
     let titleOverride: String?
+    let organizationIdentity: TabOrganizationIdentity?
+
+    private enum CodingKeys: String, CodingKey {
+        case focusedSurface, surfaceTree, effectiveFullscreenMode, tabColor, titleOverride, organizationIdentity
+    }
+
+    required init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        focusedSurface = try values.decodeIfPresent(String.self, forKey: .focusedSurface)
+        surfaceTree = try values.decode(SplitTree<Ghostty.SurfaceView>.self, forKey: .surfaceTree)
+        effectiveFullscreenMode = try values.decodeIfPresent(FullscreenMode.self, forKey: .effectiveFullscreenMode)
+        tabColor = try values.decode(TerminalTabColor.self, forKey: .tabColor)
+        titleOverride = try values.decodeIfPresent(String.self, forKey: .titleOverride)
+        do {
+            organizationIdentity = try values.decodeIfPresent(TabOrganizationIdentity.self, forKey: .organizationIdentity)
+        } catch {
+            // The additive envelope must not make otherwise valid version-7 native terminals unrestorable.
+            Ghostty.logger.error("Ignoring invalid native tab organization identity: \(error.localizedDescription)")
+            organizationIdentity = nil
+        }
+    }
 
     init(from controller: TerminalController) {
         self.focusedSurface = controller.focusedSurface?.id.uuidString
@@ -55,6 +76,7 @@ class TerminalRestorableState: TerminalRestorable {
         self.effectiveFullscreenMode = controller.fullscreenStyle?.fullscreenMode
         self.tabColor = (controller.window as? TerminalWindow)?.tabColor ?? .none
         self.titleOverride = controller.titleOverride
+        self.organizationIdentity = controller.organizationIdentity
     }
 
     required init(copy other: TerminalRestorableState) {
@@ -63,6 +85,7 @@ class TerminalRestorableState: TerminalRestorable {
         self.effectiveFullscreenMode = other.effectiveFullscreenMode
         self.tabColor = other.tabColor
         self.titleOverride = other.titleOverride
+        self.organizationIdentity = other.organizationIdentity
     }
 }
 
@@ -81,6 +104,23 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         state: NSCoder,
         completionHandler: @escaping (NSWindow?, Error?) -> Void
     ) {
+        let organizationRequest = TabOrganization.shared.nativeRestoreBegan()
+        defer { TabOrganization.shared.nativeRestoreBodyFinished(organizationRequest) }
+        #if DEBUG
+        let probeRequest = NativeRestorationProbe.shared?.nativeRestoreBegan(identifier: identifier)
+        defer { NativeRestorationProbe.shared?.nativeRestoreBodyFinished(probeRequest) }
+        #endif
+        let nativeCompletion = completionHandler
+        let completionHandler: (NSWindow?, Error?) -> Void = { window, error in
+            #if DEBUG
+            NativeRestorationProbe.shared?.nativeRestoreWillComplete(probeRequest, window: window, error: error)
+            #endif
+            nativeCompletion(window, error)
+            #if DEBUG
+            NativeRestorationProbe.shared?.nativeRestoreCompleted(probeRequest, window: window, error: error)
+            #endif
+            TabOrganization.shared.nativeRestoreCompleted(organizationRequest, window: window, error: error)
+        }
         // Verify the identifier is what we expect
         guard identifier == .init(String(describing: Self.self)) else {
             completionHandler(nil, TerminalRestoreError.identifierUnknown)
@@ -115,7 +155,8 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         // be.
         let c = TerminalController.init(
             appDelegate.ghostty,
-            withSurfaceTree: state.surfaceTree)
+            withSurfaceTree: state.surfaceTree,
+            organizationIdentity: state.organizationIdentity)
         guard let window = c.window else {
             completionHandler(nil, TerminalRestoreError.windowDidNotLoad)
             return
@@ -138,7 +179,13 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
 
             if let view = foundView {
                 c.focusedSurface = view
-                restoreFocus(to: view, inWindow: window)
+                #if DEBUG
+                NativeRestorationProbe.shared?.nativeFocusPending(probeRequest, in: window, surface: view)
+                #endif
+                TabOrganization.shared.nativeFocusPending(organizationRequest, window: window, surface: view)
+                restoreFocus(to: view, inWindow: window) { succeeded in
+                    TabOrganization.shared.nativeFocusFinished(organizationRequest, succeeded: succeeded)
+                }
             }
         }
 
@@ -155,7 +202,13 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
     /// This restores the focus state of the surfaceview within the given window. When restoring,
     /// the view isn't immediately attached to the window since we have to wait for SwiftUI to
     /// catch up. Therefore, we sit in an async loop waiting for the attachment to happen.
-    private static func restoreFocus(to: Ghostty.SurfaceView, inWindow: NSWindow, attempts: Int = 0) {
+    @MainActor
+    private static func restoreFocus(
+        to: Ghostty.SurfaceView,
+        inWindow: NSWindow,
+        attempts: Int = 0,
+        completion: @escaping (Bool) -> Void
+    ) {
         // For the first attempt, we schedule it immediately. Subsequent events wait a bit
         // so we don't just spin the CPU at 100%. Give up after some period of time.
         let after: DispatchTime
@@ -163,6 +216,10 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
             after = .now()
         } else if attempts > 40 {
             // 2 seconds, give up
+            #if DEBUG
+            NativeRestorationProbe.shared?.nativeFocusFinished(in: inWindow, surface: to, succeeded: false, reason: "attachment exhausted")
+            #endif
+            completion(false)
             return
         } else {
             after = .now() + .milliseconds(50)
@@ -171,13 +228,25 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         DispatchQueue.main.asyncAfter(deadline: after) {
             // If the view is not attached to a window yet then we repeat.
             guard let viewWindow = to.window else {
-                restoreFocus(to: to, inWindow: inWindow, attempts: attempts + 1)
+                restoreFocus(to: to, inWindow: inWindow, attempts: attempts + 1, completion: completion)
                 return
             }
 
             // If the view is attached to some other window, we give up
-            guard viewWindow == inWindow else { return }
+            guard viewWindow == inWindow else {
+                #if DEBUG
+                NativeRestorationProbe.shared?.nativeFocusFinished(in: inWindow, surface: to, succeeded: false, reason: "wrong window")
+                #endif
+                completion(false)
+                return
+            }
 
+            defer { completion(inWindow.firstResponder === to) }
+            #if DEBUG
+            defer {
+                NativeRestorationProbe.shared?.nativeFocusFinished(in: inWindow, surface: to, succeeded: inWindow.firstResponder === to, reason: "focus body returned")
+            }
+            #endif
             inWindow.makeFirstResponder(to)
 
             // If the window is main, then we also make sure it comes forward. This

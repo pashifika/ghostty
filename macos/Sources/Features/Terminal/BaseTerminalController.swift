@@ -320,10 +320,14 @@ class BaseTerminalController: NSWindowController,
     func confirmClose(
         messageText: String,
         informativeText: String,
+        onCancel: (() -> Void)? = nil,
         completion: @escaping () -> Void
     ) {
         // If we already have an alert, we need to wait for that one.
-        guard alert == nil else { return }
+        guard alert == nil else {
+            onCancel?()
+            return
+        }
 
         // If there is no window to attach the modal then we assume success
         // since we'll never be able to show the modal.
@@ -348,6 +352,8 @@ class BaseTerminalController: NSWindowController,
                 // Manager is used (#8336)
                 alertWindow.orderOut(nil)
                 completion()
+            } else {
+                onCancel?()
             }
         }
 

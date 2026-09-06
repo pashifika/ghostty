@@ -22,6 +22,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         case .native: "Terminal"
         case .hidden: "TerminalHiddenTitlebar"
         case .transparent: "TerminalTransparentTitlebar"
+        case .groups: "TerminalGroupedTitlebar"
         case .tabs:
 #if compiler(>=6.2)
             if #available(macOS 26.0, *) {
@@ -50,6 +51,33 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// For example, terminals executing custom scripts are not restorable.
     private var restorable: Bool = true
 
+    /// Stable native-tab identity, independent of the focused split or live process.
+    var organizationIdentity: TabOrganizationIdentity {
+        didSet {
+            guard organizationIdentity != oldValue else { return }
+            invalidateRestorableState()
+            window?.invalidateRestorableState()
+        }
+    }
+    private(set) var organizationWindowClosed = false
+    private var organizationClosePending = false
+
+    override var titleOverride: String? {
+        didSet {
+            if titleOverride != oldValue, isWindowLoaded {
+                TabOrganization.shared.capturedStateDidChange(self)
+            }
+        }
+    }
+
+    override var focusedSurface: Ghostty.SurfaceView? {
+        didSet {
+            if focusedSurface !== oldValue, isWindowLoaded {
+                TabOrganization.shared.capturedStateDidChange(self)
+            }
+        }
+    }
+
     /// The configuration derived from the Ghostty config so we don't need to rely on references.
     private(set) var derivedConfig: DerivedConfig
 
@@ -59,7 +87,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     init(_ ghostty: Ghostty.App,
          withBaseConfig base: Ghostty.SurfaceConfiguration? = nil,
          withSurfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil,
-         parent: NSWindow? = nil
+         parent: NSWindow? = nil,
+         organizationIdentity: TabOrganizationIdentity? = nil
     ) {
         // The window we manage is not restorable if we've specified a command
         // to execute. We do this because the restored window is meaningless at the
@@ -70,6 +99,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         // Setup our initial derived config based on the current app config
         self.derivedConfig = DerivedConfig(ghostty.config)
+        self.organizationIdentity = organizationIdentity ?? .init(tabID: UUID(), windowID: UUID())
 
         super.init(ghostty, baseConfig: base, surfaceTree: tree)
 
@@ -148,6 +178,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Whenever our surface tree changes in any way (new split, close split, etc.)
         // we want to invalidate our state.
         invalidateRestorableState()
+        if isWindowLoaded { TabOrganization.shared.capturedStateDidChange(self) }
 
         // Update our zoom state
         if let window = window as? TerminalWindow {
@@ -392,6 +423,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             return nil
         }
 
+        TabOrganization.shared.flush()
         // Create a new window and add it to the parent
         let controller = TerminalController.init(ghostty, withBaseConfig: baseConfig)
         guard let window = controller.window else { return controller }
@@ -430,6 +462,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 parent.addTabbedWindowSafely(window, ordered: .above)
             }
         }
+
+        TabOrganization.shared.tabCreated(
+            controller,
+            from: parentController,
+            atEnd: ghostty.config.windowNewTabPosition == "end")
 
         // We're dispatching this async because otherwise the lastCascadePoint doesn't
         // take effect. Our best theory is there is some next-event-loop-tick logic
@@ -570,6 +607,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         guard tabWindowsHash != v else { return }
         tabWindowsHash = v
         self.relabelTabs()
+        TabOrganization.shared.nativeStateDidChange()
     }
 
     override func syncAppearance() {
@@ -944,10 +982,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let tabIndex: Int?
         weak var tabGroup: NSWindowTabGroup?
         let tabColor: TerminalTabColor
+        let organizationIdentity: TabOrganizationIdentity
+        let organization: TabOrganization.UndoContext?
     }
 
     convenience init(_ ghostty: Ghostty.App, with undoState: UndoState) {
-        self.init(ghostty, withSurfaceTree: undoState.surfaceTree)
+        self.init(ghostty, withSurfaceTree: undoState.surfaceTree, organizationIdentity: undoState.organizationIdentity)
 
         // Show the window and restore its frame
         showWindow(nil)
@@ -987,6 +1027,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 }
             }
         }
+        TabOrganization.shared.tabRestored(self, context: undoState.organization)
     }
 
     /// The current undo state for this controller
@@ -999,7 +1040,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             focusedSurface: focusedSurface?.id,
             tabIndex: window.tabGroup?.windows.firstIndex(of: window),
             tabGroup: window.tabGroup,
-            tabColor: (window as? TerminalWindow)?.tabColor ?? .none)
+            tabColor: (window as? TerminalWindow)?.tabColor ?? .none,
+            organizationIdentity: organizationIdentity,
+            organization: TabOrganization.shared.undoContext(for: self))
     }
 
     // MARK: - NSWindowController
@@ -1083,6 +1126,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // apply this based on the root config but change it later based on surface
         // config (see focused surface change callback).
         syncAppearance(.init(config))
+        TabOrganization.shared.register(self)
+        (window as? GroupedTitlebarTerminalWindow)?.attachOrganization()
     }
 
     /// Setup correct window frame before showing the window
@@ -1141,6 +1186,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     override func windowWillClose(_ notification: Notification) {
+        organizationWindowClosed = true
+        TabOrganization.shared.unregister(self)
         super.windowWillClose(notification)
         self.relabelTabs()
 
@@ -1179,6 +1226,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         self.relabelTabs()
         self.fixTabBar()
         terminalViewContainer?.updateGlassTintOverlay(isKeyWindow: true)
+        TabOrganization.shared.nativeStateDidChange()
     }
 
     override func windowDidResignKey(_ notification: Notification) {
@@ -1216,6 +1264,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     func window(_ window: NSWindow, willEncodeRestorableState state: NSCoder) {
         let data = TerminalRestorableState(from: self)
         data.encode(with: state)
+        #if DEBUG
+        NativeRestorationProbe.shared?.windowEncoded(self)
+        #endif
     }
 
     // MARK: First Responder
@@ -1231,23 +1282,39 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     @IBAction func closeTab(_ sender: Any?) {
-        guard let window = window else { return }
-        guard window.tabGroup?.windows.count ?? 0 > 1 else {
-            closeWindow(sender)
+        closeTabWithCompletion { _ in }
+    }
+
+    /// A single native-tab close, never the native whole-window-group heuristic.
+    /// Completion runs after the actual window-close callback, or with false on cancellation.
+    func closeTabWithCompletion(_ completion: @escaping (Bool) -> Void) {
+        guard window != nil, !organizationWindowClosed, !organizationClosePending else {
+            completion(false)
             return
         }
-
+        organizationClosePending = true
+        let close = {
+            if !self.organizationWindowClosed { self.closeTabImmediately() }
+            DispatchQueue.main.async {
+                self.organizationClosePending = false
+                completion(self.organizationWindowClosed)
+            }
+        }
         guard surfaceTree.contains(where: { $0.needsConfirmQuit }) else {
-            closeTabImmediately()
+            close()
             return
         }
-
+        let isSingleWindow = (window?.tabGroup?.windows.count ?? 1) <= 1
         confirmClose(
-            messageText: "Close Tab?",
-            informativeText: "The terminal still has a running process. If you close the tab the process will be killed."
-        ) {
-            self.closeTabImmediately()
-        }
+            messageText: isSingleWindow ? "Close Window?" : "Close Tab?",
+            informativeText: isSingleWindow
+                ? "All terminal sessions in this window will be terminated."
+                : "The terminal still has a running process. If you close the tab the process will be killed.",
+            onCancel: {
+                self.organizationClosePending = false
+                completion(false)
+            },
+            completion: close)
     }
 
     @IBAction func closeOtherTabs(_ sender: Any?) {
@@ -1393,6 +1460,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Get the move action
         guard let action = notification.userInfo?[Notification.Name.GhosttyMoveTabKey] as? Ghostty.Action.MoveTab else { return }
         guard action.amount != 0 else { return }
+        if TabOrganization.shared.moveTab(self, by: action.amount) { return }
 
         // Determine our current selected index
         guard let windowController = window.windowController else { return }
@@ -1456,6 +1524,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Get the tab index from the notification
         guard let tabEnumAny = notification.userInfo?[Ghostty.Notification.GotoTabKey] else { return }
         guard let tabEnum = tabEnumAny as? ghostty_action_goto_tab_e else { return }
+        TabOrganization.shared.flush()
         let tabIndex: Int32 = tabEnum.rawValue
 
         guard let windowController = window.windowController else { return }

@@ -3180,7 +3180,7 @@ keybind: Keybinds = .{},
 @"macos-window-buttons": MacWindowButtons = .visible,
 
 /// The style of the macOS titlebar. Available values are: "native",
-/// "transparent", "tabs", and "hidden".
+/// "transparent", "tabs", "hidden", and "groups".
 ///
 /// The "native" style uses the native macOS titlebar with zero customization.
 /// The titlebar will match your window theme (see `window-theme`).
@@ -3214,12 +3214,79 @@ keybind: Keybinds = .{},
 /// areas of the frame to drag the window. This is a standard macOS behavior
 /// and not something Ghostty enables.
 ///
+/// The "groups" style is a macOS-only custom titlebar that shows the
+/// window's tabs, organized into named tab groups, in the same row as the
+/// native window controls. Like "tabs", the titlebar matches the terminal
+/// background color. The tabs themselves remain ordinary native macOS tabs:
+/// every existing tab shortcut, menu action, "Move Tab to New Window",
+/// window merge, close confirmation and closed-tab Undo keeps working, and
+/// the native tab strip is hidden instead of being shown as a second row.
+///
+/// In the "groups" style, right-click a tab to create a named group from it
+/// or to move it into an existing group. Click a group header to expand it
+/// and select its remembered tab; only one group is expanded at a time and
+/// tabs that belong to no group always follow the groups. Groups and tabs
+/// can be reordered by dragging within the strip, and dragging a tab out of
+/// the strip performs the existing native tear-off into a new window. Groups
+/// are never empty: when the last member is closed or moved away, the group
+/// disappears. Deleting a group asks first; its "Also close tabs" checkbox
+/// always starts unchecked, and unchecked deletion only removes the group
+/// while leaving every terminal running. Moving a whole group into another
+/// window is not provided; single tabs move between windows through the
+/// existing native actions and arrive ungrouped.
+///
+/// Choose Window > Focus Tab Groups to focus the strip without dragging.
+/// Arrow keys move focus, Return or Space activates a tab/group, and
+/// Control-Return or Shift-F10 opens the focused item's context menu.
+/// Delete on a focused group opens its protected deletion dialog; Escape
+/// returns keyboard focus to the terminal.
+///
+/// Group membership is saved as separate metadata in the application
+/// defaults and restored together with the native window state, governed
+/// by `window-save-state`: `always` restores groups on every relaunch,
+/// `default` follows the system-controlled restoration policy, and `never`
+/// disables both saving and restoring while retaining previously saved
+/// data (re-enabling can restore that older snapshot). Restoration
+/// recreates fresh terminal sessions with the current configuration, the
+/// saved working directories, splits and selection; it does not resume
+/// previously running commands or SSH connections. Native window state and
+/// the group metadata are separate stores managed by macOS, so the two are
+/// not one crash-atomic snapshot. Missing saved members are not recreated
+/// by the organization store; materialized native tabs without matching
+/// metadata remain ungrouped. Existing command-specific/non-restorable
+/// window eligibility is unchanged.
+///
+/// The "groups" style requires a window titlebar that can host native
+/// tabs. Combining it with `window-decoration = none`, a non-native
+/// `macos-non-native-fullscreen` mode, or a non-native `fullscreen` startup
+/// mode reports a configuration error, because those settings remove the
+/// titlebar the group strip lives in. This style is exercised only on macOS
+/// 26.6.2 (25G83) on Apple silicon (M1 Pro), with Xcode 26.2; other macOS
+/// versions and architectures are untested. Official release upgrades
+/// require regression verification on this environment.
+///
 /// The default value is "transparent". This is an opinionated choice
 /// but its one I think is the most aesthetically pleasing and works in
 /// most cases.
 ///
 /// Changing this option at runtime only applies to new windows.
 @"macos-titlebar-style": MacTitlebarStyle = .transparent,
+
+/// Whether the tabs of the custom `macos-titlebar-style = groups` strip show
+/// a close (x) button. The default value is true.
+///
+/// When false, no tab in the group strip shows a close button, including
+/// tabs that belong to no group. The tab's right-click menu still offers
+/// Close, and every existing close keybinding, menu action and
+/// running-process confirmation keeps working. Native window controls are
+/// unaffected.
+///
+/// This setting has no effect on the "native", "transparent", "tabs" and
+/// "hidden" titlebar styles, whose tab buttons are drawn by macOS.
+///
+/// This setting can be changed at runtime and applies immediately to all
+/// open grouped-style windows without closing or recreating any terminal.
+@"macos-tab-close-button": bool = true,
 
 /// Whether the proxy icon in the macOS titlebar is visible. The proxy icon
 /// is the icon that represents the folder of the current working directory.
@@ -4657,6 +4724,41 @@ pub fn finalize(self: *Config) !void {
                 "quit-after-last-window-closed-delay is set to a very short value ({f}), which might cause problems",
                 .{duration},
             );
+        }
+    }
+
+    // The grouped macOS titlebar renders inside the native titlebar row, so it
+    // cannot exist without decorations or under non-native fullscreen, which
+    // removes the titlebar. Report the conflict instead of quietly showing a
+    // legacy titlebar while the configuration claims grouped tabs.
+    if (comptime builtin.os.tag == .macos) {
+        if (self.@"macos-titlebar-style" == .groups) {
+            if (self.@"window-decoration" == .none) {
+                try self.addDiagnosticFmt(
+                    "macos-titlebar-style = groups requires window decorations; " ++
+                        "set window-decoration to a value other than none or choose another titlebar style",
+                    .{},
+                );
+            }
+
+            if (self.@"macos-non-native-fullscreen" != .false) {
+                try self.addDiagnosticFmt(
+                    "macos-titlebar-style = groups requires native macOS fullscreen; " ++
+                        "set macos-non-native-fullscreen = false or choose another titlebar style",
+                    .{},
+                );
+            }
+
+            switch (self.fullscreen) {
+                .false, .true => {},
+                .@"non-native", .@"non-native-visible-menu", .@"non-native-padded-notch" => {
+                    try self.addDiagnosticFmt(
+                        "macos-titlebar-style = groups requires native macOS fullscreen; " ++
+                            "set fullscreen = true or false, or choose another titlebar style",
+                        .{},
+                    );
+                },
+            }
         }
     }
 
@@ -8924,6 +9026,7 @@ pub const MacTitlebarStyle = enum {
     transparent,
     tabs,
     hidden,
+    groups,
 };
 
 /// See macos-titlebar-proxy-icon
@@ -10851,5 +10954,81 @@ test "compatibility: window new-window" {
             MacOSDockDropBehavior.@"new-window",
             cfg.@"macos-dock-drop-behavior",
         );
+    }
+}
+
+test "macos-titlebar-style groups reports hosts that cannot show the strip" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A decorated window with native fullscreen hosts the grouped strip.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--macos-titlebar-style=groups",
+            "--fullscreen=true",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expect(cfg.@"macos-tab-close-button");
+    }
+
+    // No decorations means no titlebar row for the strip.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--macos-titlebar-style=groups",
+            "--window-decoration=none",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(@as(usize, 1), cfg._diagnostics.items().len);
+    }
+
+    // Non-native fullscreen removes the titlebar while fullscreen.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--macos-titlebar-style=groups",
+            "--macos-non-native-fullscreen=visible-menu",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(@as(usize, 1), cfg._diagnostics.items().len);
+    }
+
+    // Startup fullscreen is independent of the toggle-mode setting.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--macos-titlebar-style=groups",
+            "--fullscreen=non-native",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(@as(usize, 1), cfg._diagnostics.items().len);
+    }
+
+    // Legacy styles keep their existing, diagnostic-free behavior.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--macos-titlebar-style=tabs",
+            "--window-decoration=none",
+            "--macos-tab-close-button=false",
+            "--fullscreen=non-native-padded-notch",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expect(!cfg.@"macos-tab-close-button");
     }
 }
