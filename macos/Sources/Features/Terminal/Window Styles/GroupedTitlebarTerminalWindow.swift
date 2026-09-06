@@ -1495,9 +1495,11 @@ private final class GroupedTabStripCanvas: NSView {
         if let dropIndicatorX {
             NSColor.controlAccentColor.setFill()
             let rowBottom = bounds.maxY - GroupedTabStrip.rowHeight
-            let rect = NSRect(x: dropIndicatorX - 1,
+            var rect = NSRect(x: dropIndicatorX - 1,
                               y: rowBottom + (GroupedTabStrip.rowHeight - GroupedTabStrip.Metrics.itemHeight) / 2,
                               width: 2, height: GroupedTabStrip.Metrics.itemHeight)
+            // Clamp to the document, not the viewport: offscreen slots must stay offscreen.
+            rect.origin.x = max(bounds.minX, min(rect.minX, bounds.maxX - rect.width))
             NSBezierPath(roundedRect: rect, xRadius: 1, yRadius: 1).fill()
         }
     }
