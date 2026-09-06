@@ -1,6 +1,54 @@
+import Vision
 import XCTest
 
 final class GroupedTitlebarAcceptanceTests: GhosttyCustomConfigCase {
+    @MainActor
+    func testTerminalScrollbackInWindowedAndFullscreenGroups() throws {
+        let app = try launchTwoMembers()
+        defer { app.terminate() }
+        let terminal = app.textViews.firstMatch
+        XCTAssertTrue(terminal.waitForExistence(timeout: 5))
+        let windowed = app.windows.firstMatch.frame
+
+        // Accessibility includes offscreen history, so assert the rendered viewport instead.
+        func showsRow(_ row: String) -> Bool {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.recognitionLanguages = ["en-US"]
+            request.usesLanguageCorrection = false
+            request.regionOfInterest = CGRect(x: 0, y: 0, width: 0.4, height: 1)
+            let image = app.windows.firstMatch.screenshot().pngRepresentation
+            try? VNImageRequestHandler(data: image).perform([request])
+            return request.results?.contains { $0.topCandidates(1).first?.string == row } == true
+        }
+
+        for fullscreen in [false, true, false] {
+            if fullscreen {
+                app.typeKey("f", modifierFlags: [.command, .control])
+                let expanded = NSPredicate { _, _ in app.windows.firstMatch.frame.width > windowed.width }
+                XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: expanded, object: app)],
+                                             timeout: 5), .completed)
+            } else if app.windows.firstMatch.frame != windowed {
+                app.typeKey("f", modifierFlags: [.command, .control])
+                XCTAssertTrue(app.wait(for: \.windows.firstMatch.frame, toEqual: windowed, timeout: 5))
+            }
+            app.typeText("printf '\\033[3J\\033[H\\033[2J'; i=1; while [ \"$i\" -le 200 ]; do printf 'SCROLL-ROW-%04d\\n' \"$i\"; i=$((i+1)); done\n")
+            let bottom = NSPredicate { _, _ in showsRow("SCROLL-ROW-0200") }
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: bottom, object: terminal)],
+                                         timeout: 5), .completed)
+            XCTAssertFalse(showsRow("SCROLL-ROW-0001"))
+            terminal.scroll(byDeltaX: 0, deltaY: -5000)
+            let top = NSPredicate { _, _ in showsRow("SCROLL-ROW-0001") }
+            let scrolled = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: top, object: terminal)],
+                                         timeout: 3) == .completed
+            capture("Terminal scrollback fullscreen \(fullscreen)", app: app)
+            XCTAssertTrue(scrolled, "Wheel must reveal the first output row; fullscreen=\(fullscreen)")
+            terminal.scroll(byDeltaX: 0, deltaY: 5000)
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: bottom, object: terminal)],
+                                         timeout: 3), .completed, "Wheel must return to the latest output")
+        }
+    }
+
     @MainActor
     func testGroupColorIndependenceAndNativeUndoOwnership() throws {
         let app = try launchTwoMembers()
@@ -507,6 +555,7 @@ final class GroupedTitlebarAcceptanceTests: GhosttyCustomConfigCase {
         XCTAssertTrue(tab("First Selected", in: app).waitForExistence(timeout: 5))
         let fixedPlusFrame = newTab.frame
         let leadingX = tab("First Selected", in: app).frame.minX
+        app.toolbars.scrollViews.firstMatch.hover()
         app.toolbars.scrollViews.firstMatch.scroll(byDeltaX: -20, deltaY: 0)
         XCTAssertTrue(app.toolbars.buttons["Scroll tabs left"].firstMatch.waitForExistence(timeout: 5))
         XCTAssertTrue(app.toolbars.buttons["Scroll tabs left"].firstMatch.isHittable)

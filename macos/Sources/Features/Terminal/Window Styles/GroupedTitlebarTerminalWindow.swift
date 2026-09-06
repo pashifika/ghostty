@@ -763,7 +763,8 @@ final class GroupedTabStrip: NSView {
     fileprivate func handleScrollWheel(_ event: NSEvent) -> Bool {
         guard window === event.window, !isHiddenOrHasHiddenAncestor else { return false }
         let point = scrollView.convert(event.locationInWindow, from: nil)
-        guard scrollView.visibleRect.contains(point) else { return false }
+        // With unclipped AppKit ancestors, visibleRect can extend over the terminal content.
+        guard scrollView.bounds.contains(point), scrollView.visibleRect.contains(point) else { return false }
         scrollView.scrollWheel(with: event)
         return true
     }
