@@ -679,10 +679,20 @@ final class GroupedTitlebarAcceptanceTests: GhosttyCustomConfigCase {
         XCTAssertTrue(tab("Terminal 1", in: app).isHittable)
         XCTAssertTrue(app.toolbars.buttons["Scroll tabs right"].firstMatch.exists)
         capture("Long full-name group label and horizontally overflowing single row", app: app)
-        app.toolbars.buttons["Scroll tabs right"].firstMatch.click()
+        let scrollRight = app.toolbars.buttons["Scroll tabs right"].firstMatch
+        for _ in 0..<8 {
+            guard scrollRight.exists else { break }
+            scrollRight.click()
+        }
+        XCTAssertFalse(scrollRight.exists)
         XCTAssertTrue(tab("Terminal 8", in: app).isHittable)
         capture("Internal scroll controls and clipped blue group accents", app: app)
-        app.toolbars.buttons["Scroll tabs left"].firstMatch.click()
+        let scrollLeft = app.toolbars.buttons["Scroll tabs left"].firstMatch
+        for _ in 0..<8 {
+            guard scrollLeft.exists else { break }
+            scrollLeft.click()
+        }
+        XCTAssertFalse(scrollLeft.exists)
         XCTAssertTrue(tab("Terminal 1", in: app).isHittable)
         XCTAssertEqual(tab("Terminal 1", in: app).value as? Int, 1)
         header(name, in: app).rightClick()
@@ -712,8 +722,9 @@ final class GroupedTitlebarAcceptanceTests: GhosttyCustomConfigCase {
         let trailingEdge = app.toolbars.buttons["Scroll tabs right"].firstMatch
             .coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5))
             .withOffset(CGVector(dx: -2, dy: 0))
+        // The wider tabs need more edge dwell to carry the first tab past every trailing member.
         tab("First Refreshed", in: app).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            .press(forDuration: 0.2, thenDragTo: trailingEdge, withVelocity: .slow, thenHoldForDuration: 2)
+            .press(forDuration: 0.2, thenDragTo: trailingEdge, withVelocity: .slow, thenHoldForDuration: 5)
         app.typeKey("9", modifierFlags: .command)
         XCTAssertEqual(tab("First Refreshed", in: app).value as? Int, 1)
         capture("Drag autoscroll moves the first tab past the clipped trailing members", app: app)

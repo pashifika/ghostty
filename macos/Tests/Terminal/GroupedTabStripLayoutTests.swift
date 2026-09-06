@@ -5,7 +5,7 @@ import Testing
 @MainActor
 struct GroupedTabStripLayoutTests {
     @Test func unequalMinimaDoNotForceUnnecessaryScrolling() throws {
-        let strip = GroupedTabStrip(frame: NSRect(x: 0, y: 0, width: 180, height: 28))
+        let strip = GroupedTabStrip(frame: NSRect(x: 0, y: 0, width: 360, height: 28))
         let tabs: [TabOrganization.TabPresentation] = [
             .init(id: UUID(), title: "", color: .none, isSelected: false),
             .init(id: UUID(), title: "A long colored terminal title", color: .blue, isSelected: false)
@@ -40,6 +40,7 @@ struct GroupedTabStripLayoutTests {
         let canvas = try #require(scroll.documentView)
         try #require(canvas.frame.width > scroll.contentSize.width)
         let minimumWidths = canvas.subviews.map { $0.frame.width }
+        #expect(minimumWidths.allSatisfy { $0 == 146 })
         let minimumContentWidth = canvas.frame.width
         strip.setFrameSize(NSSize(width: 600, height: 28))
         strip.layout()

@@ -1772,7 +1772,7 @@ private final class GroupedTabItem: GroupedStripItem {
         return width
     }
 
-    override var minimumWidth: CGFloat { chromeWidth + min(labelWidth, Metrics.tabMinLabelWidth) }
+    override var minimumWidth: CGFloat { 2 * (chromeWidth + min(labelWidth, Metrics.tabMinLabelWidth)) }
 
     override func layout() {
         super.layout()
