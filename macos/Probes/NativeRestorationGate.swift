@@ -3,7 +3,7 @@ import Foundation
 
 // Standalone executable; intentionally outside the app and XCTest source roots.
 // Build the DEBUG app with a fresh dev.pashifika.ghostty.organization-probe.<unique> bundle ID.
-// Run: xcrun swift macos/Probes/NativeRestorationGate.swift /absolute/Ghostty.app /new/evidence-directory [native|groups|groups-partial|groups-never]
+// Run: xcrun swift macos/Probes/NativeRestorationGate.swift /absolute/Ghostty.app /new/evidence-directory [native|groups|groups-partial|groups-never|groups-precolor]
 // No ApplePersistenceIgnoreState, fixture decoding, forced termination, or timed restore barrier.
 // The deadline only fails a stalled run. All success conditions come from native events.
 
@@ -227,6 +227,11 @@ private func assertOrganizationFixture(_ observation: [String: Any], root: URL) 
         }
         try require(groups.count == 2 && Set(groups.compactMap { $0["id"] as? String }).count == 2 &&
                     groups.allSatisfy { $0["name"] as? String == "Project" }, "Equal-named groups were not kept distinct")
+        try require(groups[0]["color"] as? Int == 4 && groups[1]["color"] as? Int == 1,
+                    "Group colors did not follow the reordered group identities")
+        let expectedTabColor = tab["organizationTabID"] as? String == first ? 7 :
+            (tab["organizationTabID"] as? String == third ? 2 : 0)
+        try require(tab["tabColor"] as? Int == expectedTabColor, "Group coloring changed independent tab colors")
         try require(groups[0]["tabs"] as? [String] == [third] &&
                     groups[1]["tabs"] as? [String] == [second, first] &&
                     organization["unassigned"] as? [String] == [fourth], "Semantic group/member reordering was not committed")
@@ -259,6 +264,7 @@ private func survivingOrganization(_ value: [String: Any], tabIDs: Set<String>, 
         let surviving = members.filter { tabIDs.contains($0) }
         guard !surviving.isEmpty else { return nil }
         var retained = group
+        if mode == "groups-precolor" { retained["color"] = 0 }
         retained[memberKey] = surviving
         if let selected = retained["lastSelectedTabID"] as? String, !tabIDs.contains(selected) {
             retained.removeValue(forKey: "lastSelectedTabID")
@@ -275,7 +281,7 @@ private func compareOrganizationStore(seed: [String: Any], restored: [String: An
           let actual = restored["organizationStore"] as? [String: Any] else {
         throw GateFailure("Organization metadata was not persisted")
     }
-    if mode == "groups-partial" {
+    if mode == "groups-partial" || mode == "groups-precolor" {
         let tabs = try windows(restored)
         let surviving = Set(tabs.compactMap { $0["organizationTabID"] as? String })
         guard let savedWindows = expected["windows"] as? [[String: Any]] else { throw GateFailure("Missing stored windows") }
@@ -303,7 +309,7 @@ private func compareRoundTrip(seed: [String: Any], restored: [String: Any], evid
         }
         // Window numbers and process IDs intentionally change. Compare live native
         // tab order/selection, split direction/ratio/UUIDs, focused leaf and PWDs.
-        for key in ["tabOrder", "selectedTab", "focusedSurface", "tree", "surfaces"] {
+        for key in ["tabOrder", "selectedTab", "focusedSurface", "tree", "surfaces", "tabColor"] {
             guard var old = saved[key], let new = live[key] else { throw GateFailure("Missing " + key) }
             if key == "tabOrder", let order = old as? [String] {
                 old = order.filter { survivingNativeIDs.contains($0) }
@@ -470,8 +476,8 @@ private func assertNativeEvidence(seed: [String: Any], restore: [String: Any]) t
 
 private func run() throws {
     try require((3...4).contains(CommandLine.arguments.count) &&
-                ["native", "groups", "groups-partial", "groups-never"].contains(mode),
-                "Usage: xcrun swift macos/Probes/NativeRestorationGate.swift /absolute/Ghostty.app /new/evidence-directory [native|groups|groups-partial|groups-never]")
+                ["native", "groups", "groups-partial", "groups-never", "groups-precolor"].contains(mode),
+                "Usage: xcrun swift macos/Probes/NativeRestorationGate.swift /absolute/Ghostty.app /new/evidence-directory [native|groups|groups-partial|groups-never|groups-precolor]")
     let app = URL(fileURLWithPath: CommandLine.arguments[1]).standardizedFileURL
     let root = URL(fileURLWithPath: CommandLine.arguments[2]).standardizedFileURL.resolvingSymlinksInPath()
     bundleID = Bundle(url: app)?.bundleIdentifier ?? ""
@@ -562,6 +568,27 @@ private func run() throws {
                     "Could not install the captured stale sidecar in the isolated suite")
         report["staleOrganizationSnapshot"] = snapshot
         report["partialFixtureContract"] = "An actual native-ineligible tab is omitted by AppKit; a genuine earlier organization snapshot still references it. Only isolated metadata bytes are replayed; native terminal state is never decoded or fabricated by the harness."
+    }
+    if mode == "groups-precolor" {
+        guard let isolated = UserDefaults(suiteName: bundleID + "." + runID),
+              let data = isolated.data(forKey: "tab-organization-state-v1"),
+              var snapshot = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var savedWindows = snapshot["windows"] as? [[String: Any]] else {
+            throw GateFailure("Missing genuine organization snapshot for pre-color decoding")
+        }
+        for index in savedWindows.indices {
+            guard var groups = savedWindows[index]["groups"] as? [[String: Any]] else {
+                throw GateFailure("Missing saved groups")
+            }
+            for groupIndex in groups.indices { groups[groupIndex].removeValue(forKey: "color") }
+            savedWindows[index]["groups"] = groups
+        }
+        snapshot["windows"] = savedWindows
+        let preColor = try canonical(snapshot)
+        isolated.set(preColor, forKey: "tab-organization-state-v1")
+        try require(isolated.synchronize() && isolated.data(forKey: "tab-organization-state-v1") == preColor,
+                    "Could not install pre-color metadata in the isolated suite")
+        report["preColorSnapshot"] = snapshot
     }
     if mode == "groups-never" {
         let disabled = config.replacingOccurrences(of: "window-save-state = always", with: "window-save-state = never")

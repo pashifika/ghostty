@@ -709,6 +709,7 @@ extension TerminalWindow {
     private static let tabColorSeparatorIdentifier = NSUserInterfaceItemIdentifier("com.mitchellh.ghostty.tabColorSeparator")
 
     private static let tabColorPaletteIdentifier = NSUserInterfaceItemIdentifier("com.mitchellh.ghostty.tabColorPalette")
+    private static let tabColorHeadingIdentifier = NSUserInterfaceItemIdentifier("com.mitchellh.ghostty.tabColorHeading")
 
     /// Builds a menu for an owned tab view without borrowing AppKit's native menu.
     func makeTabContextMenu(for targetWindow: TerminalWindow) -> NSMenu? {
@@ -805,7 +806,8 @@ extension TerminalWindow {
         menu.removeItems(withIdentifiers: [
             Self.tabColorSeparatorIdentifier,
             Self.changeTitleMenuItemIdentifier,
-            Self.tabColorPaletteIdentifier
+            Self.tabColorPaletteIdentifier,
+            Self.tabColorHeadingIdentifier
         ])
 
         let separator = NSMenuItem.separator()
@@ -820,14 +822,16 @@ extension TerminalWindow {
         changeTitleItem.setImageIfDesired(systemSymbolName: "pencil.line")
         menu.addItem(changeTitleItem)
 
-        let paletteItem = NSMenuItem()
-        paletteItem.identifier = Self.tabColorPaletteIdentifier
-        paletteItem.view = makeTabColorPaletteView(
+        let colorItems = makeTabColorPaletteItems(
+            title: "Tab Color",
             selectedColor: (target.window as? TerminalWindow)?.tabColor ?? .none
         ) { [weak target] color in
             (target?.window as? TerminalWindow)?.tabColor = color
         }
-        menu.addItem(paletteItem)
+        colorItems.heading.identifier = Self.tabColorHeadingIdentifier
+        colorItems.palette.identifier = Self.tabColorPaletteIdentifier
+        menu.addItem(colorItems.heading)
+        menu.addItem(colorItems.palette)
     }
 
     /// The controller action is shared; this item adds the missing single-tab validation.
@@ -856,16 +860,79 @@ extension TerminalWindow {
     }
 }
 
+/// Separate the native submenu heading so it does not hide the swatches from accessibility.
+func makeTabColorPaletteItems(
+    title: String,
+    selectedColor: TerminalTabColor,
+    selectionHandler: @escaping (TerminalTabColor) -> Void
+) -> (heading: NSMenuItem, palette: NSMenuItem) {
+    let submenu = NSMenu(title: title)
+    let selectColor: (TerminalTabColor) -> Void = { [weak submenu] color in
+        if let submenu {
+            for case let item as TabColorSelectionMenuItem in submenu.items {
+                item.state = item.color == color ? .on : .off
+            }
+        }
+        selectionHandler(color)
+    }
+    for row in TabColorMenuView.paletteRows {
+        for color in row {
+            submenu.addItem(TabColorSelectionMenuItem(
+                color: color,
+                selectedColor: selectedColor,
+                selectionHandler: selectColor
+            ))
+        }
+    }
+
+    let heading = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+    heading.submenu = submenu
+    let palette = NSMenuItem()
+    palette.view = makeTabColorPaletteView(
+        title: title,
+        selectedColor: selectedColor,
+        selectionHandler: selectColor
+    )
+    return (heading, palette)
+}
+
 private func makeTabColorPaletteView(
+    title: String,
     selectedColor: TerminalTabColor,
     selectionHandler: @escaping (TerminalTabColor) -> Void
 ) -> NSView {
     let hostingView = NSHostingView(rootView: TabColorMenuView(
+        title: title,
         selectedColor: selectedColor,
         onSelect: selectionHandler
     ))
     hostingView.frame.size = hostingView.intrinsicContentSize
     return hostingView
+}
+
+private final class TabColorSelectionMenuItem: NSMenuItem {
+    let color: TerminalTabColor
+    private let selectionHandler: (TerminalTabColor) -> Void
+
+    init(
+        color: TerminalTabColor,
+        selectedColor: TerminalTabColor,
+        selectionHandler: @escaping (TerminalTabColor) -> Void
+    ) {
+        self.color = color
+        self.selectionHandler = selectionHandler
+        super.init(title: color.localizedName, action: #selector(selectColor(_:)), keyEquivalent: "")
+        target = self
+        image = color.swatchImage(selected: false)
+        state = color == selectedColor ? .on : .off
+    }
+
+    required init(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    @MainActor
+    @objc private func selectColor(_ sender: NSMenuItem) {
+        selectionHandler(color)
+    }
 }
 
 // MARK: - Inline Tab Title Editing

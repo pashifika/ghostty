@@ -27,6 +27,39 @@ struct TabOrganizationState: Codable, Equatable {
         var name: String
         var tabIDs: [UUID]
         var lastSelectedTabID: UUID?
+        var color: TerminalTabColor = .none
+
+        init(
+            id: UUID,
+            name: String,
+            tabIDs: [UUID],
+            lastSelectedTabID: UUID? = nil,
+            color: TerminalTabColor = .none
+        ) {
+            self.id = id
+            self.name = name
+            self.tabIDs = tabIDs
+            self.lastSelectedTabID = lastSelectedTabID
+            self.color = color
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id, name, tabIDs, lastSelectedTabID, color
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            id = try values.decode(UUID.self, forKey: .id)
+            name = try values.decode(String.self, forKey: .name)
+            tabIDs = try values.decode([UUID].self, forKey: .tabIDs)
+            lastSelectedTabID = try values.decodeIfPresent(UUID.self, forKey: .lastSelectedTabID)
+            // Only pre-color snapshots omit this key; null and malformed values remain invalid.
+            if values.contains(.color) {
+                color = try values.decode(TerminalTabColor.self, forKey: .color)
+            } else {
+                color = .none
+            }
+        }
     }
 
     enum ValidationError: Error, LocalizedError {

@@ -3235,13 +3235,18 @@ keybind: Keybinds = .{},
 /// window is not provided; single tabs move between windows through the
 /// existing native actions and arrive ungrouped.
 ///
+/// Right-click a group header and choose "Group Color" to set an independent
+/// accent from the tab-color palette, including None. Expanded groups color
+/// only the gaps between their items; collapsed groups use a thin outline.
+/// Group colors never replace individual tab colors.
+///
 /// Choose Window > Focus Tab Groups to focus the strip without dragging.
 /// Arrow keys move focus, Return or Space activates a tab/group, and
 /// Control-Return or Shift-F10 opens the focused item's context menu.
 /// Delete on a focused group opens its protected deletion dialog; Escape
 /// returns keyboard focus to the terminal.
 ///
-/// Group membership is saved as separate metadata in the application
+/// Group membership and colors are saved as separate metadata in the application
 /// defaults and restored together with the native window state, governed
 /// by `window-save-state`: `always` restores groups on every relaunch,
 /// `default` follows the system-controlled restoration policy, and `never`

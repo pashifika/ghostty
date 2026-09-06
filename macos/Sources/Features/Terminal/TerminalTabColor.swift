@@ -107,22 +107,20 @@ enum TerminalTabColor: Int, CaseIterable, Codable {
 
 // MARK: - Menu View
 
-/// A SwiftUI view displaying a color palette for tab color selection.
-/// Used as a custom view inside an NSMenuItem in the tab context menu.
+/// The shared tab and group color palette hosted in contextual menus.
 struct TabColorMenuView: View {
     @State private var currentSelection: TerminalTabColor
+    let title: String
     let onSelect: (TerminalTabColor) -> Void
 
-    init(selectedColor: TerminalTabColor, onSelect: @escaping (TerminalTabColor) -> Void) {
+    init(title: String, selectedColor: TerminalTabColor, onSelect: @escaping (TerminalTabColor) -> Void) {
         self._currentSelection = State(initialValue: selectedColor)
+        self.title = title
         self.onSelect = onSelect
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text("Tab Color")
-                .padding(.bottom, 2)
-
             ForEach(Self.paletteRows, id: \.self) { row in
                 HStack(spacing: 2) {
                     ForEach(row, id: \.self) { color in
@@ -141,6 +139,8 @@ struct TabColorMenuView: View {
         .padding(.trailing, 12)
         .padding(.top, 4)
         .padding(.bottom, 4)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(title)
     }
 
     static let paletteRows: [[TerminalTabColor]] = [
@@ -159,7 +159,7 @@ struct TabColorMenuView: View {
     }
 }
 
-/// A single color swatch button in the tab color palette.
+/// A single color swatch button in the shared palette.
 private struct TabColorSwatch: View {
     let color: TerminalTabColor
     let isSelected: Bool
@@ -181,5 +181,7 @@ private struct TabColorSwatch: View {
         }
         .buttonStyle(.plain)
         .help(color.localizedName)
+        .accessibilityLabel(color.localizedName)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }

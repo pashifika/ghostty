@@ -389,8 +389,12 @@ final class NativeRestorationProbe: NSObject {
               organization.createGroup(from: third, name: "Project", in: window),
               let secondGroup = organization.presentation(for: window).groups.first(where: {
                   $0.tabs.contains(where: { $0.id == third })
-              })?.id,
-              organization.moveTab(first, to: firstGroup, index: 1, in: window),
+              })?.id else { return false }
+        organization.perform(.setGroupColor(groupID: firstGroup, color: .blue), in: window)
+        organization.perform(.setGroupColor(groupID: secondGroup, color: .red), in: window)
+        (seedControllers[0].window as? TerminalWindow)?.tabColor = .green
+        (seedControllers[2].window as? TerminalWindow)?.tabColor = .purple
+        guard organization.moveTab(first, to: firstGroup, index: 1, in: window),
               organization.moveGroup(secondGroup, index: 0, in: window) else { return false }
         emit("organizationSeeded", ["firstGroup": firstGroup.uuidString, "secondGroup": secondGroup.uuidString])
         return true
@@ -642,6 +646,7 @@ final class NativeRestorationProbe: NSObject {
         guard let window = controller.window else { return ["missingWindow": true] }
         var snapshot: [String: Any] = [
             "window": window.windowNumber, "identity": identity(window), "restorable": window.isRestorable,
+            "tabColor": (window as? TerminalWindow)?.tabColor.rawValue ?? 0,
             "restorationClass": window.restorationClass.map { String(describing: $0) } ?? "",
             "tabOrder": (window.tabGroup?.windows ?? [window]).map(identity),
             "selectedTab": (window.tabGroup?.selectedWindow).map(identity) ?? identity(window),
@@ -663,7 +668,7 @@ final class NativeRestorationProbe: NSObject {
                     "selectedTabID": presentation.selectedTabID?.uuidString ?? "",
                     "activeGroupID": presentation.activeGroupID?.uuidString ?? "",
                     "groups": presentation.groups.map { group in
-                        ["id": group.id.uuidString, "name": group.name,
+                        ["id": group.id.uuidString, "name": group.name, "color": group.color.rawValue,
                          "tabs": group.tabs.map { $0.id.uuidString }] as [String: Any]
                     },
                     "unassigned": presentation.unassigned.map { $0.id.uuidString }
