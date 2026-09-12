@@ -32,11 +32,20 @@ extension Ghostty {
         // changed with escape codes.
         @Published var pwd: String? {
             didSet {
+                // Core validates local reports; an unknown display PWD must not erase restoration state.
+                if let pwd, !pwd.isEmpty, pwd != restorationDirectory {
+                    restorationDirectory = pwd
+                    invalidateRestorableState()
+                    window?.invalidateRestorableState()
+                }
                 if pwd != oldValue, let controller = window?.windowController as? TerminalController {
                     TabOrganization.shared.capturedStateDidChange(controller)
                 }
             }
         }
+
+        /// The last nonempty local report, seeded by the initial or decoded directory candidate.
+        private(set) var restorationDirectory: String?
 
         // The cell size of this surface. This is set by the core when the
         // surface is first created and any time the cell size changes (i.e.
@@ -265,6 +274,9 @@ extension Ghostty {
         init(_ app: ghostty_app_t, baseConfig: SurfaceConfiguration? = nil, uuid: UUID? = nil) {
             self.markedText = NSMutableAttributedString()
             self.id = uuid ?? .init()
+            if let directory = baseConfig?.workingDirectory, !directory.isEmpty {
+                self.restorationDirectory = directory
+            }
 
             // Our initial config always is our application wide config.
             if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
@@ -1815,7 +1827,7 @@ extension Ghostty {
 
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
-            try container.encode(pwd, forKey: .pwd)
+            try container.encode(restorationDirectory, forKey: .pwd)
             try container.encode(id.uuidString, forKey: .uuid)
             try container.encode(title, forKey: .title)
             try container.encode(titleFromTerminal != nil, forKey: .isUserSetTitle)

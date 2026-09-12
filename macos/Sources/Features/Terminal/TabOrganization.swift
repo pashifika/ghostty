@@ -88,6 +88,11 @@ final class TabOrganization {
     var isRestoring: Bool { restoring }
     private var started = false
     private var terminating = false
+    enum PreparationResult {
+        case ready, deferred, restoring, failed
+    }
+
+    private var terminationCompletion: ((PreparationResult) -> Void)?
     private var saveEnabled = false
     private var reconciling = false
     private var nativeOperationPending = false
@@ -128,8 +133,8 @@ final class TabOrganization {
             forName: NSApplication.willTerminateNotification, object: NSApp, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.flush()
                 self?.terminating = true
+                self?.terminationCompletion = nil
             }
         })
         // The documented AppKit barrier can occur inside completionHandler. Drain its return,
@@ -139,7 +144,15 @@ final class TabOrganization {
         ) { [weak self] _, _ in
             guard let self, self.observationPending, !self.observationScheduled else { return }
             self.observationPending = false
-            self.flush(restorationBoundary: true)
+            if let completion = self.terminationCompletion {
+                let result = self.captureForTermination()
+                if result != .deferred {
+                    self.terminationCompletion = nil
+                    completion(result)
+                }
+            } else {
+                self.flush(restorationBoundary: true)
+            }
         }
         if let runLoopObserver { CFRunLoopAddObserver(CFRunLoopGetMain(), runLoopObserver, .commonModes) }
     }
@@ -203,7 +216,7 @@ final class TabOrganization {
     }
 
     func capturedStateDidChange(_ controller: TerminalController) {
-        guard !controller.organizationWindowClosed else { return }
+        guard !terminating, !controller.organizationWindowClosed else { return }
         controller.invalidateRestorableState()
         controller.window?.invalidateRestorableState()
         nativeStateDidChange()
@@ -271,16 +284,74 @@ final class TabOrganization {
         }
     }
 
-    func flush(restorationBoundary: Bool = false) {
-        guard started, !reconciling, !nativeOperationPending, !terminating else { return }
+    @discardableResult
+    func flush(restorationBoundary: Bool = false) -> PreparationResult {
+        let result = reconcileState(restorationBoundary: restorationBoundary)
+        guard result == .ready else { return result }
+        return publish()
+    }
+
+    func prepareForTermination(whenReady: @escaping (PreparationResult) -> Void) -> PreparationResult {
+        let result = captureForTermination()
+        if result == .deferred, terminationCompletion == nil {
+            terminationCompletion = whenReady
+            nativeStateDidChange()
+        }
+        return result
+    }
+
+    func cancelTerminationPreparation() {
+        terminationCompletion = nil
+        terminating = false
+        for controller in liveControllers { controller.clearPreparedRestorableState() }
+        nativeStateDidChange()
+    }
+
+    private func captureForTermination() -> PreparationResult {
+        if terminating { return .ready }
+        if started, !saveEnabled {
+            terminating = true
+            return .ready
+        }
+        if restoring, nativeRestorationFinished, didFinishLaunching, liveControllers.isEmpty,
+           requests.values.allSatisfy({ $0.completionReturned && $0.bodyReturned && $0.focusFinished }) {
+            terminating = true
+            return .ready
+        }
+        let result = reconcileState(restorationBoundary: true, requiringActivation: false)
+        if result == .restoring || result == .deferred { return .deferred }
+        guard result == .ready else { return result }
+        let eligible = liveControllers.filter { $0.window?.isRestorable == true }
+        do {
+            if saveEnabled {
+                for controller in eligible { try controller.prepareRestorableState() }
+            }
+            guard publish() == .ready else {
+                for controller in eligible { controller.clearPreparedRestorableState() }
+                return .failed
+            }
+            terminating = true
+            return .ready
+        } catch {
+            for controller in eligible { controller.clearPreparedRestorableState() }
+            Ghostty.logger.error("Cannot prepare native restoration: \(error.localizedDescription)")
+            return .failed
+        }
+    }
+
+    private func reconcileState(restorationBoundary: Bool, requiringActivation: Bool = true) -> PreparationResult {
+        guard started else { return .restoring }
+        guard !terminating else { return .ready }
+        guard !reconciling, !nativeOperationPending else { return .deferred }
         observeGroups()
         if restoring {
-            guard restorationBoundary, nativeRestorationFinished, didFinishLaunching, didBecomeActive,
+            guard restorationBoundary, nativeRestorationFinished, didFinishLaunching,
+                  didBecomeActive || !requiringActivation,
                   requests.values.allSatisfy({ $0.completionReturned && $0.bodyReturned && $0.focusFinished }),
                   nativeWindows().allSatisfy({ bucket in
                       guard let selected = bucket.selectedTabID else { return false }
                       return bucket.tabIDs.contains(selected)
-                  }) else { return }
+                  }) else { return .restoring }
             for request in requests.values where request.focusSucceeded {
                 guard request.focus?.value != nil, let window = request.window?.value else { continue }
                 // A closed/failed restored window must not hold the entire application behind the barrier.
@@ -289,7 +360,7 @@ final class TabOrganization {
                 // Observe the actual responder, not historical selection: the user may have
                 // selected another split while native restoration was finishing.
                 guard let focused = controller.focusedSurface, focused.window === window,
-                      window.firstResponder === focused else { return }
+                      window.firstResponder === focused else { return .restoring }
             }
             state = saveEnabled ? pendingState ?? .init() : .init()
             pendingState = nil
@@ -299,7 +370,7 @@ final class TabOrganization {
         } else {
             reconcile()
         }
-        publish()
+        return .ready
     }
 
     /// Read back only real native windows. Saved identities never cause a cross-window move.
@@ -504,7 +575,9 @@ final class TabOrganization {
         } == order
     }
 
-    private func publish() {
+    @discardableResult
+    private func publish() -> PreparationResult {
+        guard !terminating else { return .ready }
         let native = nativeWindows()
         var presentations: [UUID: Presentation] = [:]
         for bucket in native {
@@ -518,7 +591,7 @@ final class TabOrganization {
             lastPublishedRestoring = restoring
             NotificationCenter.default.post(name: Self.didChange, object: nil)
         }
-        guard !restoring else { return }
+        guard !restoring else { return .restoring }
         if state != lastInvalidatedState {
             lastInvalidatedState = state
             for controller in liveControllers {
@@ -529,18 +602,20 @@ final class TabOrganization {
         }
         guard saveEnabled, !store.hasInvalidState || explicitEditPending else {
             explicitEditPending = false
-            return
+            return .ready
         }
         let eligible = Set(liveControllers.filter { $0.window?.isRestorable == true }.map { $0.organizationIdentity.tabID })
         var snapshot = state
         snapshot.windows = snapshot.windows.map { Model.retaining($0, tabs: eligible, order: nil) }.filter { !$0.tabIDs.isEmpty }
-        guard snapshot != lastSavedState || explicitEditPending else { return }
+        guard snapshot != lastSavedState || explicitEditPending else { return .ready }
         do {
             try store.save(snapshot, explicitEdit: explicitEditPending)
             lastSavedState = snapshot
             explicitEditPending = false
+            return .ready
         } catch {
             Ghostty.logger.error("Cannot save tab organization: \(error.localizedDescription)")
+            return .failed
         }
     }
 

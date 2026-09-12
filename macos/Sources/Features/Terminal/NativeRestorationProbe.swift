@@ -1,6 +1,8 @@
 #if DEBUG && os(macOS)
 import Cocoa
+import Carbon
 import Combine
+import Darwin
 
 /// Opt-in instrumentation, not an organization store or an alternate restoration path.
 /// Run with macos/Probes/NativeRestorationGate.swift in the dedicated probe bundle.
@@ -20,6 +22,9 @@ final class NativeRestorationProbe: NSObject {
     private var grouped: Bool { mode != "native" }
     private var partial: Bool { mode == "groups-partial" }
     private var disabledRestore: Bool { mode == "groups-never" && phase == "restore" }
+    private var liveControllers: [TerminalController] {
+        TerminalController.all.filter { !$0.organizationWindowClosed }
+    }
     private var seedOrganizationApplied = false
     private let output: FileHandle
     private var sequence = 0
@@ -55,6 +60,32 @@ final class NativeRestorationProbe: NSObject {
     private var ready = false
     private var quitPending = false
     private var quitRequested = false
+    private var exercisePending = false
+    private var exerciseStarted = false
+    private var awaitingQuitCancellation = false
+    private var directoryUpdates: [String: (surface: UUID, directory: String)] = [:]
+    private var receivedUpdates = Set<String>()
+    private var afterDirectoryUpdates: (() -> Void)?
+    private var dialogTimer: Timer?
+    private var dialogDeadline = Date.distantFuture
+    private var dialogAction = ""
+    private var dialogKind = ""
+    private weak var dialogParent: NSWindow?
+    private var observedDialogs = Set<ObjectIdentifier>()
+    private var cleanupQuit = false
+    private var repeatRequested = false
+    private var jobPIDs: [UUID: Int32] = [:]
+
+    private var systemReason: OSType? {
+        switch mode {
+        case "groups-shutdown", "groups-host-shutdown": return OSType(kAEShutDown)
+        case "groups-restart", "groups-host-restart": return OSType(kAERestart)
+        case "groups-logout": return OSType(kAEReallyLogOut)
+        default: return nil
+        }
+    }
+
+    private var hostSeed: Bool { phase == "seed" && mode.hasPrefix("groups-host-") }
 
     private override init() {
         let environment = ProcessInfo.processInfo.environment
@@ -124,7 +155,10 @@ final class NativeRestorationProbe: NSObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.emit("applicationWillTerminate", ["orderlyQuitRequested": self.quitRequested])
+                self.emit("applicationWillTerminate", [
+                    "orderlyQuitRequested": self.quitRequested, "hostFixture": self.hostSeed,
+                    "confirmationDriverArmed": !self.dialogAction.isEmpty
+                ])
                 try? self.output.synchronize()
             }
         })
@@ -156,6 +190,7 @@ final class NativeRestorationProbe: NSObject {
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(command(_:)), name: Self.commandNotification,
             object: runID, suspensionBehavior: .deliverImmediately)
+        if hostSeed { armDialog(kind: "app", action: "observe") }
         lifecycle("willFinishLaunching")
     }
 
@@ -260,10 +295,16 @@ final class NativeRestorationProbe: NSObject {
     /// Hook directly after successful ghostty_surface_new / surfaceModel assignment.
     func surfaceCreated(_ view: Ghostty.SurfaceView) {
         createdSurfaces.append(view.id)
-        emit("surfaceCreated", ["surface": view.id.uuidString, "live": view.surface != nil])
+        emit("surfaceCreated", [
+            "surface": view.id.uuidString, "live": view.surface != nil,
+            "restorationDirectory": view.restorationDirectory ?? ""
+        ])
         view.$pwd.receive(on: DispatchQueue.main).sink { [weak self, weak view] pwd in
             guard let self, let view else { return }
-            self.emit("surfacePWD", ["surface": view.id.uuidString, "pwd": pwd ?? ""])
+            self.emit("surfacePWD", [
+                "surface": view.id.uuidString, "pwd": pwd ?? "",
+                "restorationDirectory": view.restorationDirectory ?? ""
+            ])
             self.observeNativeState(source: "surfacePWD")
         }.store(in: &subscriptions)
         view.$surfaceSize.receive(on: DispatchQueue.main).sink { [weak self] _ in
@@ -276,9 +317,10 @@ final class NativeRestorationProbe: NSObject {
         }.store(in: &subscriptions)
         view.$title.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self, weak view] title in
             guard let self, let view else { return }
+            if self.observeDirectoryUpdate(view, title: title) { return }
             self.observeChildSession(view, title: title)
         }.store(in: &subscriptions)
-        if ready { fail("A surface was created after the observation snapshot") }
+        if ready && !exercisePending { fail("A surface was created after the observation snapshot") }
     }
 
     /// Hook in the native SurfaceView decoder after its real initializer returns.
@@ -290,7 +332,9 @@ final class NativeRestorationProbe: NSObject {
 
     /// Call after TerminalController encodes its native state, never from a sidecar.
     func windowEncoded(_ controller: TerminalController) {
-        emit("windowEncoded", windowSnapshot(controller))
+        var fields = windowSnapshot(controller)
+        fields["observation"] = "Live readback at native encoder callback; decoded savedPWD is archive evidence"
+        emit("windowEncoded", fields)
     }
 
     @objc private func command(_ notification: Notification) {
@@ -300,15 +344,423 @@ final class NativeRestorationProbe: NSObject {
         }
         switch notification.userInfo?["action"] as? String {
         case "seed": seed()
-        case "quit":
-            quitPending = true
-            scheduleObservation()
+        case "exercise": exercise()
+        case "quit", "cleanup":
+            cleanupQuit = notification.userInfo?["action"] as? String == "cleanup"
+            if phase == "seed", !cleanupQuit, mode == "groups-quick-create" {
+                createImmediatelyBeforeQuit()
+            } else if phase == "seed", !cleanupQuit, mode == "groups-quick-close" {
+                closeImmediatelyBeforeQuit()
+            } else {
+                quitPending = true
+                if phase == "seed", mode == "groups-pwd-cleared", !cleanupQuit {
+                    for controller in self.liveControllers {
+                        for view in controller.surfaceTree {
+                            emit("directoryCleared", [
+                                "surface": view.id.uuidString, "previous": view.pwd ?? "",
+                                "retainedBefore": view.restorationDirectory ?? ""
+                            ])
+                            view.pwd = ""
+                        }
+                    }
+                }
+                scheduleObservation()
+            }
         default: fail("Unknown harness command")
         }
     }
 
+    /// Records the real delegate's decision, never a probe copy of its policy.
+    func terminationDecision(stage: String, reply: NSApplication.TerminateReply? = nil) {
+        let event = NSAppleEventManager.shared().currentAppleEvent
+        let reason = event?.attributeDescriptor(forKeyword: AEKeyword(kEventParamReason))
+        var fields: [String: Any] = [
+            "stage": stage, "eventPresent": event != nil,
+            "eventClass": event.map { Int($0.eventClass) } ?? -1,
+            "eventID": event.map { Int($0.eventID) } ?? -1,
+            "reasonPresent": reason != nil, "reason": reason.map { Int($0.typeCodeValue) } ?? -1,
+            "reasonDescriptorType": reason.map { Int($0.descriptorType) } ?? -1,
+            "senderPID": event?.attributeDescriptor(forKeyword: AEKeyword(keySenderPIDAttr))?.int32Value ?? -1,
+            "runningJobPIDs": jobPIDs.values.filter { kill($0, 0) == 0 }.map(Int.init).sorted(),
+            "needsConfirmQuit": (NSApp.delegate as? AppDelegate)?.ghostty.needsConfirmQuit ?? false,
+            "scope": hostSeed ? "operator-controlled host fixture" : "application path only"
+        ]
+        if let reply {
+            switch reply {
+            case .terminateNow: fields["reply"] = "terminateNow"
+            case .terminateCancel: fields["reply"] = "terminateCancel"
+            case .terminateLater: fields["reply"] = "terminateLater"
+            @unknown default: fields["reply"] = "unknown"
+            }
+        }
+        emit("terminationDecision", fields)
+        if hostSeed, stage == "requested" {
+            quitRequested = true
+            emit("preQuitObserved", stateSnapshot())
+        }
+        if stage == "preparationFailed" {
+            fail("The real termination path did not complete restoration preparation")
+        }
+        if stage == "preparationCompleted" {
+            emit("preparedSnapshot", stateSnapshot())
+            if phase == "seed", mode == "groups-prepared-mutated", !cleanupQuit {
+                for controller in self.liveControllers {
+                    for view in controller.surfaceTree {
+                        emit("preparedDirectoryMutated", [
+                            "surface": view.id.uuidString, "captured": view.restorationDirectory ?? "",
+                            "replacement": root.appendingPathComponent("a-next").path
+                        ])
+                        view.pwd = root.appendingPathComponent("a-next").path
+                    }
+                }
+                emit("postPreparationState", stateSnapshot())
+            }
+        }
+        if stage == "confirmationAccepted", phase == "seed", mode.hasPrefix("groups-pending-"), !cleanupQuit {
+            guard let window = seedControllers.first?.window else {
+                fail("Pending-work fixture has no merge target")
+                return
+            }
+            // This real action runs after the real quit alert returns, before the
+            // delegate prepares state. Its native completion has not drained yet.
+            window.mergeAllWindows(nil)
+            emit("nativeMergeRequested", stateSnapshot())
+        }
+        if reply == .terminateLater, phase == "seed", mode == "groups-pending-repeat",
+           !repeatRequested, !cleanupQuit, let delegate = NSApp.delegate as? AppDelegate {
+            repeatRequested = true
+            emit("repeatedQuitRequested", ["delivery": "actual delegate re-entry during the pending AppKit request"])
+            let repeated = delegate.applicationShouldTerminate(NSApp)
+            emit("repeatedQuitReturned", ["terminateLater": repeated == .terminateLater])
+        }
+        if reply == .terminateNow {
+            emit("terminationSnapshot", stateSnapshot())
+        } else if reply == .terminateCancel {
+            quitRequested = false
+            quitPending = false
+            if awaitingQuitCancellation {
+                awaitingQuitCancellation = false
+                stopDialogDriver()
+                // Do not run more app work from inside the returning modal/Apple event.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.emit("quitCancellationReturned", self.counters())
+                    self.changeDirectory(
+                        in: self.seedControllers[1].surfaceTree.first,
+                        to: self.root.appendingPathComponent("c-next").path)
+                    self.afterDirectoryUpdates = { [weak self] in self?.finishExercise() }
+                }
+            }
+        }
+    }
+
+    private func exercise() {
+        guard phase == "seed", ready, !exerciseStarted else {
+            fail("Exercise requested outside the ready isolated seed")
+            return
+        }
+        exerciseStarted = true
+        exercisePending = true
+        switch mode {
+        case "groups-cwd-changed":
+            changeDirectory(in: seedControllers[0].surfaceTree.first, to: root.appendingPathComponent("a-next").path)
+            changeDirectory(in: seedControllers[1].surfaceTree.first, to: root.appendingPathComponent("c-next").path)
+            changeDirectory(in: seedControllers[2].surfaceTree.first, to: FileManager.default.homeDirectoryForCurrentUser.resolvingSymlinksInPath().path)
+            afterDirectoryUpdates = { [weak self] in self?.finishExercise() }
+        case "groups-close-cancel":
+            guard let controller = seedControllers.last, let window = controller.window else {
+                fail("Missing tab for canceled close")
+                return
+            }
+            armDialog(kind: "tab", action: "cancel", parent: window)
+            controller.closeTabWithCompletion { [weak self, weak controller] closed in
+                guard let self, let controller else { return }
+                self.stopDialogDriver()
+                self.emit("closeOutcome", [
+                    "closed": closed, "identity": self.identity(window),
+                    "stillLive": self.liveControllers.contains { $0 === controller }
+                ])
+                guard !closed, self.liveControllers.contains(where: { $0 === controller }) else {
+                    self.fail("Canceled close removed its live terminal")
+                    return
+                }
+                self.changeDirectory(in: controller.surfaceTree.first, to: self.root.appendingPathComponent("e-next").path)
+                self.afterDirectoryUpdates = { [weak self] in self?.finishExercise() }
+            }
+        case "groups-quit-cancel", "groups-reason-missing", "groups-reason-unknown",
+             "groups-shutdown", "groups-restart", "groups-logout", "groups-host-shutdown", "groups-host-restart":
+            // The shell starts a real sleep job, confirms its PID with kill -0, and
+            // reports through the terminal. No needsConfirmQuit value is fabricated.
+            changeDirectory(
+                in: seedControllers[3].surfaceTree.first,
+                to: root.appendingPathComponent("e").path, startJob: true)
+            afterDirectoryUpdates = { [weak self] in
+                guard let self else { return }
+                if self.systemReason != nil {
+                    self.finishExercise()
+                } else {
+                    self.awaitingQuitCancellation = true
+                    self.performQuit(cancel: true)
+                }
+            }
+        default:
+            fail("This mode has no pre-quit exercise")
+        }
+    }
+
+    private func changeDirectory(in view: Ghostty.SurfaceView?, to directory: String, startJob: Bool = false) {
+        guard let view, let surface = view.surfaceModel, let window = view.window,
+              let session = childSessions[view.id], session["nonce"] is String else {
+            fail("Directory exercise has no real child session")
+            return
+        }
+        let token = UUID().uuidString
+        directoryUpdates[token] = (view.id, directory)
+        emit("directoryChangeRequested", [
+            "surface": view.id.uuidString, "token": token, "directory": directory,
+            "focused": view.focused, "controllerFocused": (window.windowController as? TerminalController)?.focusedSurface === view,
+            "selected": window.tabGroup?.selectedWindow === window, "startJob": startJob
+        ])
+        let script = root.appendingPathComponent("report-update.sh").path
+        surface.sendText("cd " + shellQuote(directory) + " && . " + shellQuote(script) + " " +
+                         shellQuote(token) + " " + (startJob ? "job" : "cwd") + "\r")
+    }
+
+    private func observeDirectoryUpdate(_ view: Ghostty.SurfaceView, title: String) -> Bool {
+        let prefix = "ghostty-native-update:" + runID + ":" + phase + ":"
+        guard title.hasPrefix(prefix) else { return false }
+        let token = String(title.dropFirst(prefix.count))
+        guard let pending = directoryUpdates[token], pending.surface == view.id,
+              receivedUpdates.insert(token).inserted, var session = childSessions[view.id],
+              let nonce = session["nonce"] as? String else {
+            fail("Unexpected or duplicate child directory update")
+            return true
+        }
+        do {
+            let path = root.appendingPathComponent("sessions/" + phase + "/" + nonce)
+            let fields = try String(contentsOf: path, encoding: .utf8).split(separator: "\n").map(String.init)
+            guard fields.count == 5, fields[0] == runID, fields[1] == phase,
+                  Int(fields[2]) == session["pid"] as? Int, fields[3] == nonce, fields[4] == pending.directory else {
+                fail("Directory update did not come from the same real shell in the requested directory")
+                return true
+            }
+            session["pwd"] = fields[4]
+            childSessions[view.id] = session
+            var evidence = session
+            evidence["token"] = token
+            let jobFile = root.appendingPathComponent("jobs/" + phase + "/" + nonce)
+            if FileManager.default.fileExists(atPath: jobFile.path) {
+                let value = try String(contentsOf: jobFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let pid = Int32(value), pid > 0, kill(pid, 0) == 0 else {
+                    fail("The reported child job is not running")
+                    return true
+                }
+                evidence["jobPID"] = Int(pid)
+                jobPIDs[view.id] = pid
+                evidence["jobRunning"] = true
+            }
+            emit("childDirectoryObserved", evidence)
+            observeNativeState(source: "childDirectoryObserved")
+        } catch {
+            fail("Cannot read child directory update: " + String(describing: error))
+        }
+        return true
+    }
+
+    private func finishExercise() {
+        exercisePending = false
+        let fields = stateSnapshot()
+        readyWindows = try? JSONSerialization.data(withJSONObject: fields["windows"] ?? [], options: [.sortedKeys])
+        emit("exerciseReady", fields)
+    }
+
+    private func createImmediatelyBeforeQuit() {
+        guard ready, let parent = seedControllers.last?.window,
+              let delegate = NSApp.delegate as? AppDelegate else {
+            fail("Missing native parent for rapid creation")
+            return
+        }
+        exercisePending = true
+        var config = Ghostty.SurfaceConfiguration()
+        config.workingDirectory = root.appendingPathComponent("f").path
+        guard let controller = TerminalController.newTab(delegate.ghostty, from: parent, withBaseConfig: config),
+              let surface = controller.surfaceTree.first else {
+            fail("Rapid native creation failed")
+            return
+        }
+        emit("quickCreated", [
+            "surface": surface.id.uuidString, "directory": config.workingDirectory ?? "",
+            "pwd": surface.pwd ?? "", "restorationDirectory": surface.restorationDirectory ?? ""
+        ])
+        // newTab has already queued its native show. Terminate immediately after
+        // that callback, without waiting for PWD or a coalescing interval.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.emit("preQuitObserved", self.stateSnapshot())
+            self.performQuit()
+        }
+    }
+
+    private func closeImmediatelyBeforeQuit() {
+        guard ready, let controller = seedControllers.last, let window = controller.window else {
+            fail("Missing native tab for rapid completed close")
+            return
+        }
+        exercisePending = true
+        let identity = identity(window)
+        armDialog(kind: "tab", action: "accept", parent: window)
+        controller.closeTabWithCompletion { [weak self] closed in
+            guard let self else { return }
+            self.stopDialogDriver()
+            self.emit("closeOutcome", [
+                "closed": closed, "identity": identity,
+                "stillLive": self.liveControllers.contains { $0 === controller },
+                "visible": window.isVisible
+            ])
+            guard closed, !window.isVisible, !self.liveControllers.contains(where: { $0 === controller }) else {
+                self.fail("Completed close left its terminal live")
+                return
+            }
+            self.seedControllers.removeAll { $0 === controller }
+            // Schedule the real Cocoa quit from the completed-close callback,
+            // without a harness round trip or a save timer.
+            self.emit("preQuitObserved", self.stateSnapshot())
+            self.performQuit()
+        }
+    }
+
+    private func performQuit(cancel: Bool = false) {
+        let backgroundSystemQuit = phase == "restore" && mode == "groups-background-restore" && !cleanupQuit
+        let useAppleEvent = backgroundSystemQuit || (phase == "seed" && !cleanupQuit && !hostSeed &&
+            (systemReason != nil || (cancel && mode.hasPrefix("groups-reason-"))))
+        let useCoreBinding = phase == "seed" && !cleanupQuit && mode == "groups-pending-core-quit"
+        let reason: OSType? = backgroundSystemQuit ? OSType(kAEShutDown) : (useAppleEvent
+            ? (systemReason ?? (mode == "groups-reason-unknown" ? OSType(0x70726F62) : nil)) : nil)
+        let forbidConfirmation = useAppleEvent && (backgroundSystemQuit || systemReason != nil)
+        armDialog(kind: "app", action: cancel ? "cancel" : (forbidConfirmation ? "forbid" : "accept"))
+        quitRequested = !cancel
+        emit(cancel ? "quitAttemptRequested" : "orderlyQuitRequested", [
+            "delivery": useCoreBinding ? "queued core quit binding" : (useAppleEvent ? "self-targeted quit AppleEvent" : "NSApp.terminate"),
+            "entry": useCoreBinding ? "DispatchQueue.main.async -> real core binding" : "RunLoop.main.perform(.default)",
+            "targetPID": ProcessInfo.processInfo.processIdentifier,
+            "reasonPresent": reason != nil, "reason": reason.map(Int.init) ?? -1,
+            "scope": "application path only; no host shutdown, restart or logout requested"
+        ])
+        if useCoreBinding {
+            // Exercise the production core-to-AppKit boundary from a real queued
+            // caller. Only production Ghostty.App.quit may schedule Cocoa entry.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let surface = self.seedSelection?.surfaceModel else {
+                    self?.fail("Core quit fixture lost its live surface")
+                    return
+                }
+                self.emit("coreQuitBindingRequested", ["action": "quit", "queuedCaller": true])
+                let performed = surface.perform(action: "quit")
+                self.emit("coreQuitBindingReturned", ["performed": performed])
+                if !performed { self.fail("The real core quit binding was not performed") }
+            }
+            return
+        }
+        // Model a Cocoa event entry, not a dispatch-main block: terminateLater
+        // runs a nested modal loop whose native completion may itself need main.
+        RunLoop.main.perform(inModes: [.default]) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if !useAppleEvent {
+                    NSApp.terminate(nil)
+                    return
+                }
+                let event = NSAppleEventDescriptor(
+                    eventClass: AEEventClass(kCoreEventClass), eventID: AEEventID(kAEQuitApplication),
+                    targetDescriptor: NSAppleEventDescriptor(processIdentifier: ProcessInfo.processInfo.processIdentifier),
+                    returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+                if let reason {
+                    event.setAttribute(NSAppleEventDescriptor(typeCode: reason), forKeyword: AEKeyword(kEventParamReason))
+                }
+                do {
+                    // Submission is not a decision or exit; the gate observes
+                    // actual delegate entry, modal outcome and process death.
+                    _ = try event.sendEvent(options: [.noReply, .canInteract], timeout: 10)
+                    self.emit("quitAppleEventSubmitted", ["reason": reason.map(Int.init) ?? -1])
+                } catch {
+                    self.fail("Cannot deliver quit AppleEvent to the probe's own PID: " + String(describing: error))
+                }
+            }
+        }
+    }
+
+    private func armDialog(kind: String, action: String, parent: NSWindow? = nil) {
+        stopDialogDriver()
+        observedDialogs.removeAll()
+        dialogKind = kind
+        dialogAction = action
+        dialogParent = parent
+        dialogDeadline = action == "observe" ? .distantFuture : Date().addingTimeInterval(15)
+        let timer = Timer(timeInterval: 0.02, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.observeDialog() }
+        }
+        dialogTimer = timer
+        // NSAlert.runModal and deferred termination need not drain dispatch-main.
+        RunLoop.main.add(timer, forMode: .common)
+        RunLoop.main.add(timer, forMode: .modalPanel)
+    }
+
+    private func stopDialogDriver() {
+        dialogTimer?.invalidate()
+        dialogTimer = nil
+        dialogAction = ""
+        dialogParent = nil
+    }
+
+    private func observeDialog() {
+        guard !dialogAction.isEmpty else { return }
+        if Date() > dialogDeadline {
+            fail("Armed confirmation action did not reach an observable result")
+            stopDialogDriver()
+            return
+        }
+        func descendants(_ view: NSView) -> [NSView] {
+            [view] + view.subviews.flatMap(descendants)
+        }
+        for window in NSApp.windows where window.isVisible {
+            guard let content = window.contentView else { continue }
+            let views = descendants(content)
+            let texts = views.compactMap { ($0 as? NSTextField)?.stringValue }
+            let buttons = views.compactMap { $0 as? NSButton }
+            let appAlert = texts.contains("Quit Ghostty?") &&
+                texts.contains("All terminal sessions will be terminated.") &&
+                Set(buttons.map(\.title)) == Set(["Close Ghostty", "Cancel"])
+            let tabAlert = texts.contains("Close Tab?") &&
+                texts.contains("The terminal still has a running process. If you close the tab the process will be killed.") &&
+                Set(buttons.map(\.title)) == Set(["Close", "Cancel"]) &&
+                window.sheetParent === dialogParent
+            guard (dialogKind == "app" && appAlert) || (dialogKind == "tab" && tabAlert) else { continue }
+            guard observedDialogs.insert(ObjectIdentifier(window)).inserted else { continue }
+            let action = dialogAction
+            emit("confirmationObserved", [
+                "ownerPID": ProcessInfo.processInfo.processIdentifier, "ownerBundleID": Self.bundleID,
+                "kind": dialogKind, "window": window.windowNumber, "texts": texts,
+                "buttonTitles": buttons.map(\.title), "action": action,
+                "modalWindow": NSApp.modalWindow === window
+            ])
+            if action == "observe" { return }
+            if action == "forbid" { fail("Recognized app-level system reason presented a Ghostty quit confirmation") }
+            let title = action == "accept" ? (appAlert ? "Close Ghostty" : "Close") : "Cancel"
+            guard let button = buttons.first(where: { $0.title == title }), button.isEnabled else { return }
+            stopDialogDriver()
+            // Invoke this exact owned button, not NSApp.stopModal or a global key
+            // event that could dismiss an unrelated prompt.
+            button.performClick(nil)
+            return
+        }
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     private func seed() {
-        guard phase == "seed", !seedRequested, nativeBarrier, TerminalController.all.isEmpty,
+        guard phase == "seed", !seedRequested, nativeBarrier, self.liveControllers.isEmpty,
               requests.isEmpty, let delegate = NSApp.delegate as? AppDelegate else {
             fail("Seed requested outside a clean first launch")
             return
@@ -402,7 +854,7 @@ final class NativeRestorationProbe: NSObject {
 
     private func checkReadiness() {
         recordControllerFocus(source: "runLoopBeforeWaiting")
-        let controllers = TerminalController.all
+        let controllers = self.liveControllers
         let surfaces = controllers.flatMap { Array($0.surfaceTree) }
         var waiting: [String] = []
         if !nativeBarrier { waiting.append("native app-wide barrier") }
@@ -451,36 +903,22 @@ final class NativeRestorationProbe: NSObject {
         if grouped, TabOrganization.shared.isRestoring {
             waiting.append("organization reconciliation completion")
         }
-        let windows = controllers.map(windowSnapshot).sorted {
-            ($0["identity"] as? String ?? "") < ($1["identity"] as? String ?? "")
-        }
-        var fields = counters()
-        fields["windows"] = windows
-        fields["focusRequests"] = focusSnapshot()
-        fields["sessions"] = childSessions.keys.sorted { $0.uuidString < $1.uuidString }.compactMap { childSessions[$0] }
-        fields["decodedPWDs"] = decodedPWDs
-        fields["waitingFor"] = waiting.sorted()
-        fields["failures"] = failures
-        fields["boundary"] = "main-queue delivery followed by CFRunLoop.beforeWaiting"
-        if grouped {
-            fields["organizationRestoring"] = TabOrganization.shared.isRestoring
-            if let data = UserDefaults.ghostty.data(forKey: TabOrganizationStore.key) {
-                do {
-                    fields["organizationStore"] = try JSONSerialization.jsonObject(with: data)
-                } catch {
-                    fail("Organization snapshot is not valid encoded data: " + String(describing: error))
-                }
-            }
-        }
+        let fields = stateSnapshot(waiting: waiting, boundary: "main-queue delivery followed by CFRunLoop.beforeWaiting")
         if let data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]), data != lastObservation {
             lastObservation = data
             emit("stateObserved", fields)
         }
-        let windowData = try? JSONSerialization.data(withJSONObject: windows, options: [.sortedKeys])
-        if ready, !quitRequested, windowData != readyWindows, !lateStateChange {
+        if phase == "restore", mode == "groups-background-restore",
+           !lifecycleEvents.contains("firstActivation"),
+           waiting.allSatisfy({ ["firstActivation", "organization reconciliation completion"].contains($0) }),
+           lifecycleEvents.insert("backgroundRestoreReady").inserted {
+            emit("backgroundRestoreReady", fields)
+        }
+        let windowData = try? JSONSerialization.data(withJSONObject: fields["windows"] ?? [], options: [.sortedKeys])
+        if ready, !quitRequested, !quitPending, !exercisePending, windowData != readyWindows, !lateStateChange {
             lateStateChange = true
             emit("postObservationStateChanged", fields)
-            fail("Live state changed after the observational boundary")
+            if !hostSeed { fail("Live state changed after the observational boundary") }
         }
         if !ready, waiting.isEmpty, !observationScheduled {
             ready = true
@@ -494,13 +932,21 @@ final class NativeRestorationProbe: NSObject {
                 NSApp.invalidateRestorableState()
             }
         }
+        if !directoryUpdates.isEmpty, directoryUpdates.allSatisfy({ token, pending in
+            receivedUpdates.contains(token) &&
+                surfaces.first(where: { $0.id == pending.surface })?.pwd == pending.directory
+        }) {
+            directoryUpdates.removeAll()
+            let completion = afterDirectoryUpdates
+            afterDirectoryUpdates = nil
+            completion?()
+        }
         if quitPending, !observationScheduled {
             quitPending = false
             quitRequested = true
             emit("preQuitObserved", fields)
-            emit("orderlyQuitRequested", counters())
-            // Use normal save/termination, including after a failed gate.
-            DispatchQueue.main.async { NSApp.terminate(nil) }
+            // Use the real app flow, including its modal/Apple event run loops.
+            performQuit()
         }
     }
 
@@ -515,7 +961,7 @@ final class NativeRestorationProbe: NSObject {
         let focusChanged = recordControllerFocus(source: source)
         var groupsChanged = false
         var groups: [ObjectIdentifier: NSWindowTabGroup] = [:]
-        for controller in TerminalController.all {
+        for controller in self.liveControllers {
             if let group = controller.window?.tabGroup { groups[ObjectIdentifier(group)] = group }
         }
         for key in Array(groupObservations.keys) where groups[key] == nil {
@@ -564,7 +1010,7 @@ final class NativeRestorationProbe: NSObject {
     private func recordControllerFocus(source: String) -> Bool {
         // focusedSurface is not @Published/KVO. Read on existing focus and lifecycle events.
         var changed = false
-        for controller in TerminalController.all {
+        for controller in self.liveControllers {
             let key = ObjectIdentifier(controller)
             let focused = controller.focusedSurface?.id.uuidString ?? ""
             guard controllerFocus[key] != focused else { continue }
@@ -629,6 +1075,32 @@ final class NativeRestorationProbe: NSObject {
         }
     }
 
+    private func stateSnapshot(waiting: [String] = [], boundary: String = "synchronous main-actor readback") -> [String: Any] {
+        let controllers = self.liveControllers
+        let liveIDs = Set(controllers.flatMap { $0.surfaceTree.map(\.id) })
+        var fields = counters()
+        fields["windows"] = controllers.map(windowSnapshot).sorted {
+            ($0["identity"] as? String ?? "") < ($1["identity"] as? String ?? "")
+        }
+        fields["focusRequests"] = focusSnapshot()
+        fields["sessions"] = liveIDs.sorted { $0.uuidString < $1.uuidString }.compactMap { childSessions[$0] }
+        fields["decodedPWDs"] = decodedPWDs
+        fields["waitingFor"] = waiting.sorted()
+        fields["failures"] = failures
+        fields["boundary"] = boundary
+        if grouped {
+            fields["organizationRestoring"] = TabOrganization.shared.isRestoring
+            if let data = UserDefaults.ghostty.data(forKey: TabOrganizationStore.key) {
+                do {
+                    fields["organizationStore"] = try JSONSerialization.jsonObject(with: data)
+                } catch {
+                    fail("Organization snapshot is not valid encoded data: " + String(describing: error))
+                }
+            }
+        }
+        return fields
+    }
+
     private func counters() -> [String: Any] {
         ["requests": requests.count, "callbackEntries": enteredCompletions.count,
          "completions": completedRequests.count, "finishedRestoreBodies": finishedRestoreBodies.count,
@@ -655,6 +1127,7 @@ final class NativeRestorationProbe: NSObject {
             "tree": controller.surfaceTree.root.map(treeSnapshot) ?? [:],
             "surfaces": controller.surfaceTree.map { view in
                 ["id": view.id.uuidString, "pwd": view.pwd ?? "", "live": view.surface != nil,
+                 "restorationDirectory": view.restorationDirectory ?? "",
                  "attached": view.window === window] as [String: Any]
             }
         ]

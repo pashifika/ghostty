@@ -51,6 +51,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// For example, terminals executing custom scripts are not restorable.
     private var restorable: Bool = true
 
+    private var preparedRestorableState: CodableBridge<TerminalRestorableState>?
+
     /// Stable native-tab identity, independent of the focused split or live process.
     var organizationIdentity: TabOrganizationIdentity {
         didSet {
@@ -1259,11 +1261,24 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         Self.lastMain = self
     }
 
+    /// Called after eligible live windows and their organization have been reconciled.
+    func prepareRestorableState() throws {
+        guard preparedRestorableState == nil else { return }
+        preparedRestorableState = try CodableBridge(preparing: TerminalRestorableState(from: self))
+    }
+
+    func clearPreparedRestorableState() {
+        guard preparedRestorableState != nil else { return }
+        preparedRestorableState = nil
+        invalidateRestorableState()
+        window?.invalidateRestorableState()
+    }
+
     // Called when the window will be encoded. We handle the data encoding here in the
     // window controller.
     func window(_ window: NSWindow, willEncodeRestorableState state: NSCoder) {
-        let data = TerminalRestorableState(from: self)
-        data.encode(with: state)
+        let data = preparedRestorableState ?? CodableBridge(TerminalRestorableState(from: self))
+        TerminalRestorableState.encode(data, with: state)
         #if DEBUG
         NativeRestorationProbe.shared?.windowEncoded(self)
         #endif

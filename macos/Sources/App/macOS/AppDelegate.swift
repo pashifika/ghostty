@@ -1,4 +1,5 @@
 import AppKit
+import Carbon
 import SwiftUI
 import UserNotifications
 import OSLog
@@ -16,6 +17,9 @@ class AppDelegate: NSObject,
         subsystem: Bundle.main.bundleIdentifier!,
         category: String(describing: AppDelegate.self)
     )
+
+    private var terminationPending = false
+    private var terminationDeadline: Timer?
 
     /// Various menu items so that we can programmatically sync the keyboard shortcut with the Ghostty config
     @IBOutlet private var menuAbout: NSMenuItem?
@@ -386,61 +390,113 @@ class AppDelegate: NSObject,
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        #if DEBUG
+        NativeRestorationProbe.shared?.terminationDecision(stage: "requested")
+        #endif
+        let reply: NSApplication.TerminateReply
+        if terminationPending {
+            reply = .terminateLater
+        } else if acceptsTermination() {
+            reply = prepareTermination()
+        } else {
+            TabOrganization.shared.cancelTerminationPreparation()
+            reply = .terminateCancel
+        }
+        #if DEBUG
+        NativeRestorationProbe.shared?.terminationDecision(stage: "reply", reply: reply)
+        #endif
+        return reply
+    }
+
+    static func isSystemTermination(_ event: NSAppleEventDescriptor?) -> Bool {
+        guard let event, event.eventClass == kCoreEventClass, event.eventID == kAEQuitApplication,
+              let reason = event.attributeDescriptor(forKeyword: AEKeyword(kEventParamReason)) else { return false }
+        switch reason.typeCodeValue {
+        case kAEShutDown, kAERestart, kAEReallyLogOut:
+            return true
+        default:
+            return false
+        }
+    }
+
+    @MainActor
+    private func acceptsTermination() -> Bool {
         let windows = NSApplication.shared.windows
-        if windows.isEmpty { return .terminateNow }
-
-        // If we've already accepted to install an update, then we don't need to
-        // confirm quit. The user is already expecting the update to happen.
-        if updateController.isInstalling {
-            return .terminateNow
+        if windows.isEmpty || updateController.isInstalling || windows.allSatisfy({ !$0.isVisible }) {
+            return true
         }
+        if Self.isSystemTermination(NSAppleEventManager.shared().currentAppleEvent) { return true }
+        if !ghostty.needsConfirmQuit { return true }
 
-        // This probably isn't fully safe. The isEmpty check above is aspirational, it doesn't
-        // quite work with SwiftUI because windows are retained on close. So instead we check
-        // if there are any that are visible. I'm guessing this breaks under certain scenarios.
-        //
-        // NOTE(mitchellh): I don't think we need this check at all anymore. I'm keeping it
-        // here because I don't want to remove it in a patch release cycle but we should
-        // target removing it soon.
-        if (windows.allSatisfy { !$0.isVisible }) {
-            return .terminateNow
-        }
-
-        // If the user is shutting down, restarting, or logging out, we don't confirm quit.
-        why: if let event = NSAppleEventManager.shared().currentAppleEvent {
-            // If all Ghostty windows are in the background (i.e. you Cmd-Q from the Cmd-Tab
-            // view), then this is null. I don't know why (pun intended) but we have to
-            // guard against it.
-            guard let keyword = AEKeyword("why?") else { break why }
-
-            if let why = event.attributeDescriptor(forKeyword: keyword) {
-                switch why.typeCodeValue {
-                case kAEShutDown, kAERestart, kAEReallyLogOut:
-                    return .terminateNow
-
-                default:
-                    break
-                }
-            }
-        }
-
-        // If our app says we don't need to confirm, we can exit now.
-        if !ghostty.needsConfirmQuit { return .terminateNow }
-
-        // We have some visible window. Show an app-wide modal to confirm quitting.
         let alert = NSAlert()
         alert.messageText = "Quit Ghostty?"
         alert.informativeText = "All terminal sessions will be terminated."
         alert.addButton(withTitle: "Close Ghostty")
         alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            return .terminateNow
+        #if DEBUG
+        NativeRestorationProbe.shared?.terminationDecision(stage: "confirmationPresented")
+        #endif
+        let accepted = alert.runModal() == .alertFirstButtonReturn
+        #if DEBUG
+        NativeRestorationProbe.shared?.terminationDecision(
+            stage: accepted ? "confirmationAccepted" : "confirmationCancelled")
+        #endif
+        return accepted
+    }
 
-        default:
-            return .terminateCancel
+    @MainActor
+    private func prepareTermination() -> NSApplication.TerminateReply {
+        let result = TabOrganization.shared.prepareForTermination { [weak self] result in
+            self?.completeDeferredTermination(result)
         }
+        guard result == .deferred else {
+            #if DEBUG
+            NativeRestorationProbe.shared?.terminationDecision(
+                stage: result == .ready ? "preparationCompleted" : "preparationFailed")
+            #endif
+            if result == .failed {
+                TabOrganization.shared.cancelTerminationPreparation()
+                return .terminateCancel
+            }
+            return .terminateNow
+        }
+        terminationPending = true
+        // A deadline is failure, never evidence that native preparation completed.
+        let timer = Timer(timeInterval: 10, target: self,
+                          selector: #selector(terminationPreparationTimedOut(_:)), userInfo: nil, repeats: false)
+        terminationDeadline = timer
+        RunLoop.main.add(timer, forMode: .common)
+        RunLoop.main.add(timer, forMode: .modalPanel)
+        return .terminateLater
+    }
+
+    @MainActor
+    @objc private func terminationPreparationTimedOut(_ timer: Timer) {
+        guard terminationPending, timer === terminationDeadline else { return }
+        Self.logger.error("Native restoration preparation did not complete before termination")
+        completeDeferredTermination(.failed)
+    }
+
+    @MainActor
+    private func completeDeferredTermination(_ result: TabOrganization.PreparationResult) {
+        guard terminationPending else { return }
+        terminationPending = false
+        terminationDeadline?.invalidate()
+        terminationDeadline = nil
+        #if DEBUG
+        NativeRestorationProbe.shared?.terminationDecision(
+            stage: result == .ready ? "preparationCompleted" : "preparationFailed")
+        #endif
+        if result != .ready {
+            TabOrganization.shared.cancelTerminationPreparation()
+            Self.logger.error("Canceling termination because restoration preparation failed")
+        }
+        #if DEBUG
+        NativeRestorationProbe.shared?.terminationDecision(
+            stage: "reply", reply: result == .ready ? .terminateNow : .terminateCancel)
+        #endif
+        NSApp.reply(toApplicationShouldTerminate: result == .ready)
     }
 
     func applicationWillTerminate(_ notification: Notification) {

@@ -26,16 +26,21 @@ extension TerminalRestorable {
             return nil
         }
 
-        guard let v = aDecoder.decodeObject(of: CodableBridge<Self>.self, forKey: Self.selfKey) else {
+        guard let v = aDecoder.decodeObject(of: CodableBridge<Self>.self, forKey: Self.selfKey),
+              let value = v.value else {
             return nil
         }
 
-        self.init(copy: v.value)
+        self.init(copy: value)
     }
 
     func encode(with coder: NSCoder) {
+        Self.encode(CodableBridge(self), with: coder)
+    }
+
+    static func encode(_ state: CodableBridge<Self>, with coder: NSCoder) {
         coder.encode(Self.version, forKey: Self.versionKey)
-        coder.encode(CodableBridge(self), forKey: Self.selfKey)
+        coder.encode(state, forKey: Self.selfKey)
     }
 }
 

@@ -686,8 +686,10 @@ extension Ghostty {
             #endif
 
             #if os(macOS)
-            // We want to quit, start that process
-            NSApplication.shared.terminate(nil)
+            // Let the main dispatch block return before a deferred termination runs its modal loop.
+            RunLoop.main.perform(inModes: [.default, .modalPanel, .eventTracking]) {
+                NSApplication.shared.terminate(nil)
+            }
             #endif
         }
 
