@@ -1,3 +1,4 @@
+import Foundation
 import GhosttyKit
 
 extension Ghostty {
@@ -24,12 +25,14 @@ extension Ghostty {
         }
 
         deinit {
-            // deinit is not guaranteed to happen on the main actor and our API
-            // calls into libghostty must happen there so we capture the surface
-            // value so we don't capture `self` and then we detach it in a task.
-            // We can't wait for the task to succeed so this will happen sometime
-            // but that's okay.
             let surface = self.surface
+            #if os(macOS)
+            // Unregister before the view's userdata becomes invalid.
+            if Thread.isMainThread {
+                ghostty_surface_free(surface)
+                return
+            }
+            #endif
             Task.detached { @MainActor in
                 ghostty_surface_free(surface)
             }

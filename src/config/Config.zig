@@ -2190,6 +2190,15 @@ keybind: Keybinds = .{},
 /// integration, such as preserving working directories. See `shell-integration`
 /// for more information.
 ///
+/// Each split retains its last known local working directory, including in
+/// background tabs. Missing directories follow `working-directory`.
+/// Restored sessions use current startup configuration; running commands and
+/// SSH connections are not resumed.
+///
+/// Completed tab changes and directory reports request state saving. Orderly
+/// quit prepares state before teardown; failed preparation cancels that quit.
+/// Forced termination or storage failure can prevent restoration.
+///
 /// There are three valid values for this configuration:
 ///
 ///   * `default` will use the default system behavior. On macOS, this
@@ -2470,6 +2479,11 @@ keybind: Keybinds = .{},
 /// any confirmation. This can also be set to `always`, which will always
 /// confirm closing a surface, even if shell integration says a process isn't
 /// running.
+///
+/// On macOS, a recognized shutdown, restart, or logout request bypasses this
+/// confirmation, even with `always`. Other close requests retain their existing
+/// confirmation behavior. Skipping confirmation does not skip state preparation
+/// or preserve running jobs.
 @"confirm-close-surface": ConfirmCloseSurface = .true,
 
 /// Whether or not to quit after the last surface is closed.
