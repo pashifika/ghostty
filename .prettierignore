@@ -3,7 +3,9 @@ flake.lock
 vendor/
 **/*.html
 zig-cache/
+.zig-cache/
 zig-out/
+zig-pkg/
 
 # jujutsu
 .jj/
@@ -26,3 +28,11 @@ website/.next
 # fuzz corpus files
 test/fuzz-libghostty/corpus/
 test/fuzz-libghostty/afl-out/
+
+# local-only working directories (agent skills, planning repo, release
+# archives, vendored reference sources); all are untracked here
+.omp/
+.rasen/
+rasen/
+local_docs/
+examples/
