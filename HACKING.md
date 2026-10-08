@@ -26,6 +26,21 @@ When you're developing Ghostty, it's very likely that you will want to build a
 _debug_ build to diagnose issues more easily. This is already the default for
 Zig builds, so simply run `zig build` **without any `-Doptimize` flags**.
 
+On macOS, Debug builds do not publish the "New Ghostty Tab Here" and
+"New Ghostty Window Here" Services menu items. This prevents development builds
+with different bundle identifiers from adding duplicate entries to Finder.
+Use a Release or ReleaseLocal build to develop or test these services.
+Older Debug apps may still have registered services. Unregister each affected
+app with the following commands, replacing the example path:
+
+```shell
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "/path/to/debug/Ghostty.app"
+/System/Library/CoreServices/pbs -update
+```
+
+This does not delete the app. Launching an older Debug app can register its
+services again; rebuild it with the current settings before launching it.
+
 There are many more build steps than just `zig build`, some of which are listed
 here:
 

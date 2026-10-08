@@ -1170,6 +1170,7 @@
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "A program running within Ghostty would like to use speech recognition.";
 				INFOPLIST_KEY_NSSystemAdministrationUsageDescription = "A program running within Ghostty requires elevated privileges.";
 				INFOPLIST_PREPROCESS = YES;
+				INFOPLIST_PREPROCESSOR_DEFINITIONS = "GHOSTTY_DISABLE_SERVICES=1";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
