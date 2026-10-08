@@ -63,6 +63,7 @@
 	<true/>
 	<key>OSAScriptingDefinition</key>
 	<string>Ghostty.sdef</string>
+#ifndef GHOSTTY_DISABLE_SERVICES
 	<key>NSServices</key>
 	<array>
 		<dict>
@@ -104,6 +105,7 @@
 			</array>
 		</dict>
 	</array>
+#endif
 	<key>SUEnableAutomaticChecks</key>
 	<false/>
 	<key>SUPublicEDKey</key>
